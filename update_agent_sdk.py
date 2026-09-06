@@ -24,6 +24,7 @@ import base64
 import json
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -461,22 +462,44 @@ def remote_path(channel, tool, version):
     return f"$HOME/{CHANNELS[channel][1]}/data/agent-host/sdk-cache/{tool}/{version}"
 
 
-def ssh_read_product(server: str, channel: str):
-    """读服务器上该通道最新 bin/<commit>/product.json(取不到返回 None,不致命)。"""
+def ssh_find_products(server: str, channel: str):
+    """服务器上该通道所有 server/product.json 的路径(按 mtime 从新到旧)。
+
+    新版布局: ~/.vscode-server[-insiders]/cli/servers/<Quality>-<commit>/server/product.json;
+    旧版布局: .../bin/<commit>/product.json。排除 .staging 未完成下载与 extensions。
+    """
     home_dir = CHANNELS[channel][1]
+    find_cmd = (
+        f'find "$HOME/{home_dir}" \\( -name "*.staging" -o -name extensions \\) -prune '
+        f'-o -name product.json -print 2>/dev/null'
+    )
     try:
-        out = ssh_run(server, f'find "$HOME/{home_dir}/bin" -maxdepth 2 -name product.json '
-                              f'-printf "%T@ %p\\n" 2>/dev/null | sort -rn | head -1')
+        paths = [p for p in ssh_run(server, find_cmd).splitlines() if p.strip()]
     except ScriptError:
-        return None
-    if not out.strip():
-        return None
-    path = out.split(" ", 1)[1] if " " in out else out
+        return []
+    if not paths or len(paths) == 1:
+        return paths
+    quoted = " ".join(shlex.quote(p) for p in paths)
     try:
-        text = ssh_run(server, f'cat -- "{path}"')
-        return json.loads(text)
-    except (ScriptError, json.JSONDecodeError):
-        return None
+        out = ssh_run(server, f'for f in {quoted}; do echo "$(stat -c %Y "$f" 2>/dev/null '
+                              f'|| stat -f %m "$f" 2>/dev/null) $f"; done | sort -rn | head -1')
+    except ScriptError:
+        return paths
+    if " " in out:
+        mtime, _, path = out.partition(" ")
+        if mtime.isdigit():
+            return [path.strip()]
+    return paths
+
+
+def ssh_read_product(server: str, channel: str):
+    """读服务器上该通道最新的 product.json(取不到返回 None,不致命)。"""
+    for path in ssh_find_products(server, channel):
+        try:
+            return json.loads(ssh_run(server, f'cat -- "{path}"'))
+        except (ScriptError, json.JSONDecodeError):
+            continue
+    return None
 
 
 def _server_cache_dir(tool: str, channel: str, version: str):

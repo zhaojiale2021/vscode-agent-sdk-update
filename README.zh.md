@@ -18,6 +18,8 @@
 - 版本来源——**按通道解析**(每个 VS Code 构建都内置了自己 pin 的 agent-SDK 版本):
   1. 该通道已安装 VS Code `product.json`(`resources/app/product.json`)内置的 `agentSdks`
      映射;新版安装目录带一层 commit 哈希子目录,新旧两种布局都会自动识别、取最新。
+     服务器端则通过 SSH 读 `~/.vscode-server[-insiders]` 下的
+     `cli/servers/<Quality>-<commit>/server/…`(旧 `bin/<commit>/…` 也识别,排除 `.staging` 未完成下载)。
      这是该构建的 agent-host 实际会请求的版本——例如 stable 1.136.x 内置 claude `0.3.239`、codex `0.146.0`。
   2. 找不到安装信息 / 旧构建没有 `agentSdks`: 回退到 [microsoft/vscode](https://github.com/microsoft/vscode)
      仓库 `package.json` 的 `devDependencies`——stable 按已装版本推导对应 `release/<x>` 分支,

@@ -17,10 +17,11 @@ version each channel expects**, so local claude / codex just work.
 ## How it works
 
 - Version source — resolved **per channel** (each VS Code build pins its own agent-SDK versions):
-  1. The `agentSdks` map embedded in that channel's installed VS Code `product.json`
-     (`resources/app/product.json`; since the build hash may live in a versioned subdirectory,
-     both layouts are detected, newest wins). This is what the agent-host of that exact build
-     requests — e.g. stable 1.136.x ships claude `0.3.239`, codex `0.146.0`.
+  1. The `agentSdks` map embedded in that channel's installed VS Code `product.json` — for
+     servers read via SSH from `~/.vscode-server[-insiders]` (`cli/servers/<Quality>-<commit>/server/…`,
+     old `bin/<commit>/…` also detected, `.staging` downloads excluded, newest wins).
+     This is what the agent-host of that exact build requests — e.g. stable 1.136.x ships
+     claude `0.3.239`, codex `0.146.0`.
   2. No install info found / build without `agentSdks`: `devDependencies` of the vscode
      repository's `package.json` — stable uses the matching `release/<x>` branch (derived from
      the installed version), Insiders uses `main` (the `--branch` fallback).
