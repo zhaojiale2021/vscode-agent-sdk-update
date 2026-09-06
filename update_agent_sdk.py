@@ -11,12 +11,16 @@ triggers the download" 时永远不会触发下载, 本脚本提前把 SDK 缓�
     python update_agent_sdk.py --channel insiders      # 只更新 Insiders
     python update_agent_sdk.py --tool codex --dry-run  # 只预览
 
-版本来源: microsoft/vscode <branch>(默认 main)的 package.json 中
-devDependencies 的 @anthropic-ai/claude-agent-sdk / @openai/codex 版本。
+版本来源(按通道取「实际」对应关系): 优先读该通道已安装 VS Code 自带
+product.json 的 agentSdks——构建时写死的 claude/codex 版本与 CDN 模板,
+即 agent-host 实际会请求的版本(如 stable 1.136.x 内置 claude 0.3.239)。
+取不到时回退 microsoft/vscode 仓库 package.json 的 devDependencies:
+stable → 对应 release/<x>, insiders → <branch>(默认 main)。
 下载地址:  https://main.vscode-cdn.net/agent-sdk/<tool>/<version>/<arch>.tgz
 """
 
 import argparse
+import base64
 import json
 import os
 import platform
@@ -28,12 +32,20 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# GitHub 仓库优先走 raw(raw.githubusercontent 部分地区不可达时回退 api,内容一致)
 REPO_PKG_URL = "https://raw.githubusercontent.com/microsoft/vscode/{branch}/package.json"
+API_PKG_URL = "https://api.github.com/repos/microsoft/vscode/contents/package.json?ref={branch}"
 CDN_URL = "https://main.vscode-cdn.net/agent-sdk/{tool}/{version}/{arch}.tgz"
 
 TOOL_NPM = {
     "claude": "@anthropic-ai/claude-agent-sdk",
     "codex": "@openai/codex",
+}
+
+# channel → 常见安装目录名(新版安装目录下还有一层 <commit>/resources/app)
+INSTALL_DIR_NAMES = {
+    "stable":   ("Microsoft VS Code", "Visual Studio Code"),
+    "insiders": ("Microsoft VS Code Insiders", "Visual Studio Code - Insiders"),
 }
 
 # channel -> (Windows AppData 子目录, 服务器 ~ 下的子目录)
@@ -44,7 +56,7 @@ CHANNELS = {
 CHANNEL_LABEL = {"insiders": "Insiders", "stable": "Stable"}
 
 REMOTE_ARCH = "linux-x64"
-USER_AGENT = "agent-sdk-updater/1.1"
+USER_AGENT = "agent-sdk-updater/1.2"
 CHUNK = 1 << 20  # 1 MiB
 
 
@@ -88,22 +100,151 @@ def http_get_text(url, timeout=60):
 # ---------------------------------------------------------------- 版本
 
 def fetch_versions(branch):
-    """返回 {tool: 版本号}，来源 microsoft/vscode <branch> 的 package.json。"""
-    text = http_get_text(REPO_PKG_URL.format(branch=branch))
+    """返回 {tool: 版本号}，来源 microsoft/vscode <branch> 的 package.json。
+
+    raw.githubusercontent.com 在部分地区不可达,失败时自动回退
+    api.github.com 的 contents 接口(base64 内容,同一文件)。
+    """
+    last = None
+    for url in (REPO_PKG_URL.format(branch=branch), API_PKG_URL.format(branch=branch)):
+        try:
+            text = http_get_text(url)
+            pkg = _parse_pkg_text(text)
+        except ScriptError as e:
+            last = e
+            continue
+        deps = {}
+        for key in ("dependencies", "devDependencies"):
+            deps.update(pkg.get(key) or {})
+        versions = {}
+        for tool, npm in TOOL_NPM.items():
+            ver = deps.get(npm)
+            if not ver:
+                raise ScriptError(f"package.json 中未找到依赖 {npm}")
+            versions[tool] = ver.lstrip("~^>=< ")  # 若写成 ^1.2.3 则取 1.2.3
+        return versions
+    raise ScriptError(f"获取 {branch} 的 package.json 失败: {last}")
+
+
+def _parse_pkg_text(text):
+    """raw 内容直接是 JSON;api.contents 返回 {"content": <base64>} 的 JSON。"""
     try:
-        pkg = json.loads(text)
+        obj = json.loads(text)
     except json.JSONDecodeError as e:
         raise ScriptError(f"package.json 解析失败: {e}")
-    deps = {}
-    for key in ("dependencies", "devDependencies"):
-        deps.update(pkg.get(key) or {})
-    versions = {}
-    for tool, npm in TOOL_NPM.items():
-        ver = deps.get(npm)
+    if isinstance(obj, dict) and "content" in obj and "dependencies" not in obj:
+        try:
+            obj = json.loads(base64.b64decode(obj["content"]).decode("utf-8"))
+        except (json.JSONDecodeError, ValueError) as e:
+            raise ScriptError(f"package.json 解码失败: {e}")
+    return obj
+
+
+def minor_branch(version):
+    """"1.136.1" / "1.138.0-insider" → "release/1.136"; 解析不出返回 None。"""
+    parts = version.split(".")
+    if len(parts) >= 2 and all(p.isdigit() for p in parts[:2]):
+        return f"{parts[0]}.{parts[1]}"
+    return None
+
+
+def branch_versions(memo, branch):
+    """按分支取 {tool: 版本}(在 memo 里缓存,本机/服务器多个通道只请求一次)。"""
+    if branch not in memo:
+        memo[branch] = fetch_versions(branch)
+    return memo[branch]
+
+
+def _app_roots(channel):
+    """该通道可能的安装根目录列表(不含 resources/app)。"""
+    win_name, mac_name = INSTALL_DIR_NAMES[channel]
+    roots = []
+    if sys.platform == "win32":
+        for env in ("LOCALAPPDATA", "ProgramFiles"):
+            base = os.environ.get(env)
+            if base:
+                roots.append(Path(base) / "Programs" / win_name if env == "LOCALAPPDATA"
+                             else Path(base) / win_name)
+    elif sys.platform == "darwin":
+        roots.append(Path(f"/Applications/{mac_name}.app/Contents/Resources/app"))
+    else:  # Linux 桌面/便携安装常见目录(服务器场景另走 ~/.vscode-server)
+        for d in ("/usr/share/code", "/usr/lib/code", "/opt/visual-studio-code",
+                  "/snap/code/current/usr/share/code"):
+            roots.append(Path(d))
+    return roots
+
+
+def find_product_json(channel):
+    """在该通道的安装目录里找 product.json,返回 (路径, dict) 或 (None, None)。
+
+    新版安装布局为 <install>/<commit>/resources/app/product.json(commit 为
+    12 位短哈希子目录),旧布局为 <install>/resources/app/product.json;
+    同一目录可能残留多版(自动更新),取修改时间最新的一个。
+    """
+    cands = []
+    for root in _app_roots(channel):
+        cands.append(root / "resources" / "app" / "product.json")
+        try:
+            for d in root.iterdir():
+                if d.is_dir():
+                    cands.append(d / "resources" / "app" / "product.json")
+        except OSError:
+            pass
+    best, best_mt = None, -1
+    for cand in cands:
+        try:
+            mt = cand.stat().st_mtime
+        except OSError:
+            continue
+        if mt > best_mt:
+            best, best_mt = cand, mt
+    if best is None:
+        return None, None
+    try:
+        with open(best, encoding="utf-8") as f:
+            return best, json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"  警告: 读取 {best} 失败({e}),改走仓库分支回退", flush=True)
+        return None, None
+
+
+def resolve_versions(product, channel, tools, branch, memo):
+    """按通道解析每个 tool 的目标版本,返回 {tool: (版本, 来源说明)}。
+
+    优先级(即「实际」的版本对应关系):
+      1. 已安装 VS Code product.json 内置 agentSdks(构建时写死,最准);
+      2. stable 且已知安装版本 → vscode 仓库 release/<x>(与 1 内容一致);
+      3. 回退参数 --branch(stable 默认 main 只适用于 Insiders,会提示)。
+    """
+    pver = (product or {}).get("version") or ""
+    sdks = (product or {}).get("agentSdks") or {}
+    result = {}
+    for tool in tools:
+        spec = sdks.get(tool)
+        ver = spec.get("version") if isinstance(spec, dict) else spec
+        if isinstance(ver, str) and ver:
+            result[tool] = (ver, f"已装 VS Code {pver} 内置 product.json agentSdks")
+            continue
+        if channel == "stable" and pver:
+            minor = minor_branch(pver)
+            if minor:
+                try:
+                    rver = branch_versions(memo, f"release/{minor}").get(tool)
+                except ScriptError:
+                    rver = None
+                if rver:
+                    result[tool] = (rver, f"已装 VS Code {pver} 对应 vscode release/{minor}")
+                    continue
+        try:
+            ver = branch_versions(memo, branch).get(tool)
+        except ScriptError as e:
+            raise ScriptError(f"[{tool}] 无可用版本来源: {e}")
         if not ver:
-            raise ScriptError(f"package.json 中未找到依赖 {npm}")
-        versions[tool] = ver.lstrip("~^>=< ")  # 若写成 ^1.2.3 则取 1.2.3
-    return versions
+            raise ScriptError(f"[{tool}] vscode {branch} 的 package.json 中没有 {TOOL_NPM[tool]}")
+        hint = " (警告: main 实际是 Insiders 行,若目标是 stable 请用 --branch release/<x>)" \
+            if channel == "stable" and branch == "main" else ""
+        result[tool] = (ver, f"vscode {branch} devDependencies{hint}")
+    return result
 
 
 def local_arch():
@@ -320,77 +461,113 @@ def remote_path(channel, tool, version):
     return f"$HOME/{CHANNELS[channel][1]}/data/agent-host/sdk-cache/{tool}/{version}"
 
 
-def push_server(server: str, tool: str, version: str, channels, cache: TgzCache):
-    """按 channel 推送 linux-x64(某个服务器通道已装时直接服务器内 cp -a 复用,免下载)。
+def ssh_read_product(server: str, channel: str):
+    """读服务器上该通道最新 bin/<commit>/product.json(取不到返回 None,不致命)。"""
+    home_dir = CHANNELS[channel][1]
+    try:
+        out = ssh_run(server, f'find "$HOME/{home_dir}/bin" -maxdepth 2 -name product.json '
+                              f'-printf "%T@ %p\\n" 2>/dev/null | sort -rn | head -1')
+    except ScriptError:
+        return None
+    if not out.strip():
+        return None
+    path = out.split(" ", 1)[1] if " " in out else out
+    try:
+        text = ssh_run(server, f'cat -- "{path}"')
+        return json.loads(text)
+    except (ScriptError, json.JSONDecodeError):
+        return None
 
-    只处理服务器上 profile 目录真实存在的通道,未安装的通道跳过、不创建目录。
+
+def _server_cache_dir(tool: str, channel: str, version: str):
+    return f"{remote_path(channel, tool, version)}/{REMOTE_ARCH}"
+
+
+def _server_install_cmd(tool: str, channel: str, version: str, remote_tgz: str):
+    """服务器端原子解压安装命令: mkdir → 解压到 .tmp → 校验 → 改名 → 写 .complete。"""
+    cache_path = remote_path(channel, tool, version)
+    tmp_dir = f"{cache_path}/{REMOTE_ARCH}.tmp"
+    target = f"{cache_path}/{REMOTE_ARCH}"
+    return (
+        f'mkdir -p -- "{cache_path}" && '
+        f'rm -rf -- "{tmp_dir}" && mkdir -p -- "{tmp_dir}" && '
+        f'tar -xzf "{remote_tgz}" -C "{tmp_dir}" && '
+        f'test -f "{tmp_dir}/node_modules/{TOOL_NPM[tool]}/package.json" && '
+        f'mv -- "{tmp_dir}" "{target}" && '
+        f'touch -- "{target}/.complete"'
+    )
+
+
+def _server_copy_cmd(tool: str, dst_channel: str, src_channel: str, version: str):
+    """服务器内 cp -a 复用同版本已装副本(mv 前用文件存在性做校验)。"""
+    cache_path = remote_path(dst_channel, tool, version)
+    tmp_dir = f"{cache_path}/{REMOTE_ARCH}.tmp"
+    target = f"{cache_path}/{REMOTE_ARCH}"
+    return (
+        f'mkdir -p -- "{cache_path}" && '
+        f'rm -rf -- "{tmp_dir}" && '
+        f'cp -a -- "{_server_cache_dir(tool, src_channel, version)}" "{tmp_dir}" && '
+        f'test -f "{tmp_dir}/node_modules/{TOOL_NPM[tool]}/package.json" && '
+        f'mv -- "{tmp_dir}" "{target}" && '
+        f'touch -- "{target}/.complete"'
+    )
+
+
+def push_server(server: str, tool: str, specs: dict, cache: TgzCache):
+    """按 channel 推送 linux-x64;specs = {channel: 期望版本}(只含已安装通道)。
+
+    某通道已装好时跳过;同版本在服务器其他通道已装时直接服务器内 cp -a 复用,
+    免下载 linux 包;都没有时才 scp tgz 过去逐个通道解压(同版本只传一次)。
     """
-    cache_dir = lambda c: f"{remote_path(c, tool, version)}/{REMOTE_ARCH}"
     statuses = {}
-    active = {}
     missing = []
-    for c in channels:
-        if not remote_channel_exists(server, c):
-            statuses[c] = f"通道未安装(服务器无 {CHANNELS[c][1]} 目录),跳过"
-            continue
-        active[c] = ssh_run(server, f'if [ -f "{cache_dir(c)}/.complete" ]; then echo EXISTS; else echo MISSING; fi') == "EXISTS"
-        if active[c]:
+    for c, ver in specs.items():
+        if ssh_run(server, f'if [ -f "{_server_cache_dir(tool, c, ver)}/.complete" ]; '
+                           f'then echo YES; else echo NO; fi') == "YES":
             statuses[c] = "已是最新(服务器 .complete 已存在)"
         else:
-            missing.append(c)
+            missing.append((c, ver))
     if not missing:
         return statuses
 
-    # 其他通道已安装的,服务器上直接 cp -a 复用,不再下载 linux 包
-    copied = []
-    for c in missing:
-        src = next((c2 for c2, ok in active.items() if ok), None)
+    by_ver = {}
+    for c, ver in missing:
+        by_ver.setdefault(ver, []).append(c)
+
+    # 同版本已装在其他通道 → 服务器内直接复制
+    for ver, group in by_ver.items():
+        src = next((c for c, v in specs.items() if v == ver and statuses.get(c)), None)
         if src is None:
             continue
-        tmp_dir = f"{remote_path(c, tool, version)}/{REMOTE_ARCH}.tmp"
-        target = cache_dir(c)
-        cmd = (
-            f'mkdir -p -- "{remote_path(c, tool, version)}" && '
-            f'rm -rf -- "{tmp_dir}" && '
-            f'cp -a -- "{cache_dir(src)}" "{tmp_dir}" && '
-            f'test -f "{tmp_dir}/node_modules/{TOOL_NPM[tool]}/package.json" && '
-            f'mv -- "{tmp_dir}" "{target}" && '
-            f'touch -- "{target}/.complete"'
-        )
-        ssh_run(server, cmd)
-        statuses[c] = "服务器已更新(复用另一通道已装副本,免下载)"
-        copied.append(c)
+        for c in group:
+            ssh_run(server, _server_copy_cmd(tool, c, src, ver))
+            statuses[c] = "服务器已更新(复用另一通道同版本副本,免下载)"
 
-    rest = [c for c in missing if c not in copied]
+    rest = [(c, ver) for ver, group in by_ver.items() for c in group
+            if c not in statuses]
     if not rest:
         return statuses
 
-    tgz = cache.get(tool, version, REMOTE_ARCH)
-    remote_tgz = f"/tmp/agent-sdk-{tool}-{version}.tgz"
-    print(f"  scp → {server}:{remote_tgz}", flush=True)
-    scp_push(server, tgz, remote_tgz)
+    remote_tgzs = []
     try:
-        for channel in rest:
-            cache_path = remote_path(channel, tool, version)
-            tmp_dir = f"{cache_path}/{REMOTE_ARCH}.tmp"
-            target = f"{cache_path}/{REMOTE_ARCH}"
-            cmd = (
-                f'mkdir -p "{cache_path}" && '
-                f'rm -rf -- "{tmp_dir}" && mkdir -p -- "{tmp_dir}" && '
-                f'tar -xzf "{remote_tgz}" -C "{tmp_dir}" && '
-                f'test -f "{tmp_dir}/node_modules/{TOOL_NPM[tool]}/package.json" && '
-                f'mv -- "{tmp_dir}" "{target}" && '
-                f'touch -- "{target}/.complete"'
-            )
-            ssh_run(server, cmd)
-            statuses[channel] = "服务器已更新(linux-x64,.complete 已写入)"
-        ssh_run(server, f'rm -f -- "{remote_tgz}"')
-    except BaseException:
-        try:
-            ssh_run(server, f'rm -f -- "{remote_tgz}"')
-        except ScriptError:
-            pass
-        raise
+        by_ver = {}
+        for c, ver in rest:
+            by_ver.setdefault(ver, []).append(c)
+        for ver, group in by_ver.items():
+            tgz = cache.get(tool, ver, REMOTE_ARCH)
+            remote_tgz = f"/tmp/agent-sdk-{tool}-{ver}.tgz"
+            print(f"  scp → {server}:{remote_tgz}", flush=True)
+            scp_push(server, tgz, remote_tgz)
+            remote_tgzs.append(remote_tgz)
+            for c in group:
+                ssh_run(server, _server_install_cmd(tool, c, ver, remote_tgz))
+                statuses[c] = f"服务器已更新({ver} linux-x64,.complete 已写入)"
+    finally:
+        for remote_tgz in remote_tgzs:
+            try:
+                ssh_run(server, f'rm -f -- "{remote_tgz}"')
+            except ScriptError:
+                pass
     return statuses
 
 
@@ -406,21 +583,20 @@ def plan_local(root: Path, tool: str, version: str, arch: str, sources):
     return f"将下载 {version} 并安装到 {target}"
 
 
-def plan_server(server: str, tool: str, version: str, channels):
+def plan_server(server: str, tool: str, specs: dict):
+    """dry-run: 报告服务器每个通道将做什么;specs = {channel: 期望版本}。"""
     statuses = {}
-    cache_dir = lambda c: f"{remote_path(c, tool, version)}/{REMOTE_ARCH}"
-    exists = {}
-    for c in channels:
-        if not remote_channel_exists(server, c):
-            statuses[c] = f"通道未安装(服务器无 {CHANNELS[c][1]} 目录),跳过"
-            continue
-        exists[c] = ssh_run(server, f'if [ -f "{cache_dir(c)}/.complete" ]; then echo EXISTS; else echo MISSING; fi') == "EXISTS"
-        if exists[c]:
+    for c, ver in specs.items():
+        installed = ssh_run(server, f'if [ -f "{_server_cache_dir(tool, c, ver)}/.complete" ]; '
+                                    f'then echo YES; else echo NO; fi') == "YES"
+        if installed:
             statuses[c] = "已是最新(跳过)"
-        elif any(ok for ok in exists.values()):
-            statuses[c] = "将复用服务器另一通道已装副本(免下载)"
+        elif any(v == ver and ssh_run(server, f'if [ -f "{_server_cache_dir(tool, c2, v)}/.complete" ]; '
+                                               f'then echo YES; else echo NO; fi') == "YES"
+                 for c2, v in specs.items() if c2 != c):
+            statuses[c] = "将复用服务器另一通道同版本副本(免下载)"
         else:
-            statuses[c] = f"将下载并推送 {version} linux-x64 到服务器"
+            statuses[c] = f"将下载并推送 {ver} linux-x64 到服务器"
     return statuses
 
 
@@ -431,16 +607,21 @@ def main():
 
     ap = argparse.ArgumentParser(
         description="更新 VS Code agent-host 的 SDK 缓存(claude/codex,stable+Insiders),"
-                    "版本取自 microsoft/vscode 的 package.json;免 Copilot 订阅也可本地使用 claude/codex",
+                    "版本按通道取「实际」对应关系(已安装 VS Code product.json 的 agentSdks,"
+                    "取不到时回退 vscode 仓库 release/<x> 或 main);"
+                    "免 Copilot 订阅也可本地使用 claude/codex",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--server", metavar="SSH_ALIAS", help="SSH 别名或 user@host;指定后同步 linux-x64 到远程服务器")
     ap.add_argument("--tool", choices=("claude", "codex", "all"), default="all", help="默认 all")
     ap.add_argument("--channel", choices=("insiders", "stable", "both"), default="both",
                     help="更新哪些安装通道(默认 both)")
-    ap.add_argument("--branch", default="main", help="vscode 仓库分支或 tag(默认 main;如需 stable 对应版本可指定 release/<x>)")
+    ap.add_argument("--branch", default="main",
+                    help="回退用的 vscode 仓库分支或 tag(默认 main,即 Insiders 行)。"
+                         "找不到安装的 product.json 时: insiders 应保持 main,"
+                         "stable 请指定 release/<x> 才能拿到对应版本")
     ap.add_argument("--local-root", type=Path, default=None,
-                    help="本机缓存根目录(默认按 channel 从 %APPDATA% / ~ 自动推导:"
+                    help="本机缓存根目录(默认按 channel 从 %%APPDATA%% / ~ 自动推导:"
                          "Code 与 Code - Insiders 下的 agent-host/sdk-cache)")
     ap.add_argument("--dry-run", action="store_true", help="只报告打算做什么,不落盘")
     ap.add_argument("--local-only", action="store_true", help="只更新本机,跳过远程")
@@ -457,47 +638,79 @@ def main():
     do_local = not args.server_only
     do_remote = bool(args.server) and not args.local_only
 
-    try:
-        versions = fetch_versions(args.branch)
-    except ScriptError as e:
-        err(str(e))
-        return 1
-
-    arch = None
-    sources = None            # 两通道的缓存根目录,用于「同版本已装则直接复用」的检测
     failures = 0
     cache = TgzCache()
     try:
-        for tool in tools:
-            ver = versions[tool]
-            print(f"[{tool}] 期望版本 {ver}", flush=True)
-            if do_local:
+        memo = {}                 # branch → {tool: 版本},避免同一分支重复请求
+
+        # ---- 1. 每个通道先解析「实际」期望版本(本机读安装 product.json,服务器 SSH 读) ----
+        local_specs = {}          # channel -> {tool: (版本, 来源)}
+        if do_local:
+            for channel in channels:
+                label = CHANNEL_LABEL[channel]
+                if not local_channel_exists(channel, args.local_root):
+                    print(f"  本机[{label}]: 通道未安装(无 {CHANNELS[channel][0]} 目录),跳过", flush=True)
+                    continue
+                _, product = find_product_json(channel)
                 try:
-                    if arch is None:
-                        arch = local_arch()
-                    if sources is None:
-                        sources = [args.local_root or default_local_root(c) for c in CHANNELS]
-                    for channel in channels:
-                        label = CHANNEL_LABEL[channel]
-                        if not local_channel_exists(channel, args.local_root):
-                            print(f"  本机[{label}]: 通道未安装(无 {CHANNELS[channel][0]} 目录),跳过", flush=True)
-                            continue
-                        root = args.local_root or default_local_root(channel)
+                    specs = resolve_versions(product, channel, tools, args.branch, memo)
+                except ScriptError as e:
+                    err(f"[本机 {label}] {e}")
+                    failures += 1
+                    continue
+                local_specs[channel] = specs
+                print(f"  本机[{label}] 期望: " + " · ".join(
+                    f"{t} {v}({s})" for t, (v, s) in specs.items()), flush=True)
+
+        server_specs = {}         # channel -> {tool: (版本, 来源)}
+        if do_remote:
+            for channel in channels:
+                label = CHANNEL_LABEL[channel]
+                if not remote_channel_exists(args.server, channel):
+                    print(f"  服务器[{label}]: 通道未安装(服务器无 {CHANNELS[channel][1]} 目录),跳过", flush=True)
+                    continue
+                product = ssh_read_product(args.server, channel)
+                try:
+                    specs = resolve_versions(product, channel, tools, args.branch, memo)
+                except ScriptError as e:
+                    err(f"[服务器 {label}] {e}")
+                    failures += 1
+                    continue
+                server_specs[channel] = specs
+                print(f"  服务器[{label}] 期望: " + " · ".join(
+                    f"{t} {v}({s})" for t, (v, s) in specs.items()), flush=True)
+
+        # ---- 2. 逐个 tool 执行(每个通道用自己解析出的版本) ----
+        if do_local and local_specs:
+            arch = local_arch()
+            sources = [args.local_root or default_local_root(c) for c in CHANNELS]
+            for tool in tools:
+                for channel, specs in local_specs.items():
+                    ver, _ = specs[tool]
+                    root = args.local_root or default_local_root(channel)
+                    label = CHANNEL_LABEL[channel]
+                    try:
                         status = plan_local(root, tool, ver, arch, sources) if args.dry_run \
                             else install_local(root, tool, ver, arch, cache, sources)
-                        print(f"  本机[{label}]: {status}", flush=True)
-                except ScriptError as e:
-                    err(f"[{tool}] 本机更新失败: {e}")
-                    failures += 1
-            if do_remote:
+                    except ScriptError as e:
+                        err(f"[本机 {label} {tool}] {e}")
+                        failures += 1
+                        continue
+                    print(f"  本机[{label}]: {status}", flush=True)
+
+        if do_remote and server_specs:
+            for tool in tools:
+                specs_tool = {c: specs[tool][0] for c, specs in server_specs.items()}
                 try:
-                    statuses = plan_server(args.server, tool, ver, channels) if args.dry_run \
-                        else push_server(args.server, tool, ver, channels, cache)
-                    for channel in channels:
-                        print(f"  服务器[{CHANNEL_LABEL[channel]}]: {statuses[channel]}", flush=True)
+                    statuses = plan_server(args.server, tool, specs_tool) if args.dry_run \
+                        else push_server(args.server, tool, specs_tool, cache)
                 except ScriptError as e:
-                    err(f"[{tool}] 服务器推送失败: {e}")
+                    err(f"[服务器 {tool}] {e}")
                     failures += 1
+                    continue
+                for channel in server_specs:
+                    print(f"  服务器[{CHANNEL_LABEL[channel]}]: {statuses[channel]}", flush=True)
+
         return 1 if failures else 0
     finally:
         cache.cleanup()

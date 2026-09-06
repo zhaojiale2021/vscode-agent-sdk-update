@@ -11,12 +11,19 @@ Without a Copilot subscription, agent-host cannot trigger the SDK download itsel
 ```
 
 but "session triggers the download" never happens, leaving claude / codex unavailable.
-This script pre-seeds the SDK packages (versions matching the [microsoft/vscode](https://github.com/microsoft/vscode)
-repository's `package.json` dependencies) into the agent-host sdk-cache directory, so local claude / codex just work.
+This script pre-seeds the SDK packages into the agent-host sdk-cache directory with the **actual
+version each channel expects**, so local claude / codex just work.
 
 ## How it works
 
-- Version source: `devDependencies` of the vscode repository's `package.json` (default `main` branch)
+- Version source — resolved **per channel** (each VS Code build pins its own agent-SDK versions):
+  1. The `agentSdks` map embedded in that channel's installed VS Code `product.json`
+     (`resources/app/product.json`; since the build hash may live in a versioned subdirectory,
+     both layouts are detected, newest wins). This is what the agent-host of that exact build
+     requests — e.g. stable 1.136.x ships claude `0.3.239`, codex `0.146.0`.
+  2. No install info found / build without `agentSdks`: `devDependencies` of the vscode
+     repository's `package.json` — stable uses the matching `release/<x>` branch (derived from
+     the installed version), Insiders uses `main` (the `--branch` fallback).
   - claude ← `@anthropic-ai/claude-agent-sdk`
   - codex  ← `@openai/codex`
 - Download URL: `https://main.vscode-cdn.net/agent-sdk/<tool>/<version>/<arch>.tgz`
@@ -52,7 +59,7 @@ python update_agent_sdk.py --server-only --server <alias>  # server push only
 | `--server <SSH_ALIAS>` | SSH alias or `user@host` from ~/.ssh/config; pushes linux-x64 to the server when given |
 | `--channel insiders\|stable\|both` | default `both` |
 | `--tool claude\|codex\|all` | default `all` |
-| `--branch <branch or tag>` | vscode repository branch/tag, default `main`; point at `release/<x>` for the stable-channel version |
+| `--branch <branch or tag>` | vscode repository branch/tag used as fallback when no installed `product.json` is found; default `main` (the Insiders line — for a stable install use `release/<x>`) |
 | `--local-root <path>` | local cache root; by default derived per channel from `%APPDATA%` / `~` |
 | `--dry-run` | report planned actions only, no download/extract/push |
 | `--local-only` / `--server-only` | run one side only |
@@ -92,3 +99,8 @@ Linux server (when running directly on the server, it automatically uses the `~/
 - **The version directory exists but the SDK files are stale**: check whether the version verification failed in the logs; use `--dry-run` to see which version it intends to install.
 - **First download is slow**: claude ≈ 96MB, codex ≈ 133MB, roughly 1-3 minutes depending on your connection.
 - **Verify connectivity with `ssh <alias>` before a server push**.
+- **The cache contains a newer version (e.g. claude `0.3.258`) than my stable build expects**: older script versions took the version from the repo `main` branch, which is the Insiders line.
+  The expected version for stable is the `agentSdks` entry of the installed `product.json` — just run the script again (or `--channel stable`); it installs the matching version next to the old
+  ones. Old directories are never deleted and are harmless — the agent-host only looks up the version its own build pins.
+- **`agentSdks` / `main` mismatch still possible?**: if no installed `product.json` is found (e.g. portable zip), stable falls back to `--branch` which defaults to `main`; the script prints a warning in that case — pass `--branch release/<x>` explicitly.
+- **GitHub is unreachable but `api.github.com` works**: the script falls back from `raw.githubusercontent.com` to the GitHub contents API automatically.
