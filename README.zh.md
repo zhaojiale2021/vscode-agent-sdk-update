@@ -27,6 +27,11 @@
   - claude ← `@anthropic-ai/claude-agent-sdk`
   - codex  ← `@openai/codex`
 - 下载地址: `https://main.vscode-cdn.net/agent-sdk/<tool>/<version>/<arch>.tgz`
+- **服务器架构由 SSH 探测**(`uname -s`/`uname -m`,失败再试
+  `cmd /c echo %OS% %PROCESSOR_ARCHITECTURE%`),所以 Windows 服务器下载的是 `win32-x64`
+  (CDN 上没有 `win-x64`)而不是 `linux-x64`;可用 `--remote-arch` 强制覆盖。
+  默认 shell 是 Git Bash/MSYS/Cygwin 的 Windows 服务器走与 Linux 相同的 POSIX 命令;
+  默认 shell 是 `cmd`/PowerShell 的则通过 `powershell -EncodedCommand`(base64)执行,避开多层引号转义。
 - 支持的安装通道(默认 `both`):
 
   | 通道 | 本机缓存(Windows) | 本机缓存(其他平台) | 服务器缓存(SSH) |
@@ -34,13 +39,16 @@
   | Insiders | `~/AppData/Roaming/Code - Insiders/agent-host/sdk-cache/` | `~/.vscode-server-insiders/data/agent-host/sdk-cache/` | `~/.vscode-server-insiders/data/agent-host/sdk-cache/` |
   | Stable | `~/AppData/Roaming/Code/agent-host/sdk-cache/` | `~/.vscode-server/data/agent-host/sdk-cache/` | `~/.vscode-server/data/agent-host/sdk-cache/` |
 
+  Windows **服务器**上的 `~` 是 `%USERPROFILE%`(如 `C:\Users\me\.vscode-server\data\agent-host\sdk-cache\`),
+  Windows **本机**客户端上的 `~` 是 `%APPDATA%`。
   实际目录: `<...>/sdk-cache/<tool>/<version>/<arch>/`,arch 如 `win32-x64` / `linux-x64`。
 - 完成标记: 解压校验完成后在 `<arch>/` 下新建空文件 `.complete`,与 agent-host 原生布局一致
 
 ## 前提
 
 - 本机: Python 3(纯标准库,零依赖);Windows 10 1803+(自带 System32\tar.exe);网络可达 vscode-cdn.net
-- 推送服务器: SSH 免密(密钥已配置在 ~/.ssh),服务器自带 tar
+- 推送服务器: SSH 免密(密钥已配置在 ~/.ssh),服务器自带 tar;
+  Windows 服务器另需 PowerShell 与 `System32\tar.exe`(Windows 10 1803+ / Server 2019+)
 
 ## 用法
 
@@ -55,7 +63,8 @@ python update_agent_sdk.py --server-only --server <别名>  # 只推送服务器
 
 | 参数 | 说明 |
 |---|---|
-| `--server <SSH_ALIAS>` | SSH 别名或 `user@host`,来自 ~/.ssh/config;给出后同时推送 linux-x64 到服务器 |
+| `--server <SSH_ALIAS>` | SSH 别名或 `user@host`,来自 ~/.ssh/config;给出后把 SDK 包推到服务器,架构自动探测(`linux-x64` / `win32-x64` / …) |
+| `--remote-arch <arch>` | 强制指定服务器架构,跳过探测(如 `win32-x64`、`linux-arm64`) |
 | `--channel insiders\|stable\|both` | 默认 `both` |
 | `--tool claude\|codex\|all` | 默认 `all` |
 | `--branch <分支或tag>` | 找不到安装的 product.json 时才用到的 vscode 仓库分支/tag;默认 `main`(Insiders 行,目标是 stable 时应指 `release/<x>`) |
@@ -67,8 +76,9 @@ python update_agent_sdk.py --server-only --server <别名>  # 只推送服务器
 **只更新已安装的通道**:某通道的 VS Code profile 目录(本机 `%APPDATA%\Code` / `Code - Insiders`、
 服务器 `~/.vscode-server` / `~/.vscode-server-insiders`)不存在时,视为该通道未安装,直接跳过且**不会创建任何目录**。
 **同版本已在任何一处装好,就不重复下载**:本机某通道已装好时,其余缺失通道直接复制该已装目录
-(`robocopy` / `cp -a`,免下载);服务器同理——服务器某通道已装好时,其余通道在服务器内直接 `cp -a` 复用,
-不再下载 linux 包。只有任何一处都没有副本时,才「下载 → 流式校验包内 version 字段 → 解压 → 原子改名 → 写 `.complete`」;
+(`robocopy` / `cp -a`,免下载);服务器同理——服务器某通道已装好时,其余通道在服务器内直接复用
+(POSIX 下 `cp -a`,Windows 下 `Copy-Item`),不再下载;服务器内复制失败时自动回落到下载安装。
+只有任何一处都没有副本时,才「下载 → 流式校验包内 version 字段 → 解压 → 原子改名 → 写 `.complete`」;
 同一版本需要装多个目标时该包也只下载一次(本机各通道、服务器各通道均复用)。
 任一失败即清理临时产物,逐个 tool 独立,一个失败不影响另一个。
 
@@ -93,6 +103,10 @@ Linux 服务器(若直接在服务器上跑:服务器上会自动走 `~/.vscode-
 ## 常见问题
 
 - **`win-x64` 会 404**: CDN 上 arch 名为 `win32-x64`(缓存目录同样是 `win32-x64`),脚本自动识别,无需关心。
+- **我要推送到 Windows 服务器**: 架构会探测成 `win32-x64` / `win32-arm64`,不再是 `linux-x64`;缓存位于
+  `%USERPROFILE%\.vscode-server[-insiders]\data\agent-host\sdk-cache`。默认 shell 是 Git Bash 的 Windows 服务器
+  走普通 POSIX 命令,`cmd`/PowerShell 的走 `powershell -NoProfile -EncodedCommand`;探测不准或系统特殊时
+  可加 `--remote-arch win32-x64`。服务器需有 `System32\tar.exe`(Windows 10 1803+ / Server 2019+)和 PowerShell。
 - **明明升级了版本目录里却没有新 SDK 文件**: 检查失败日志中是否版本校验未通过,可用 `--dry-run` 先看打算装哪个版本。
 - **首次下载较慢**: claude ≈ 96MB、codex ≈ 133MB,视网速约 1-3 分钟。
 - **服务器推送前请先 `ssh <别名>` 手动验证连通性**。

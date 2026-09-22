@@ -28,6 +28,12 @@ version each channel expects**, so local claude / codex just work.
   - claude ← `@anthropic-ai/claude-agent-sdk`
   - codex  ← `@openai/codex`
 - Download URL: `https://main.vscode-cdn.net/agent-sdk/<tool>/<version>/<arch>.tgz`
+- **Server arch is detected over SSH** (`uname -s`/`uname -m`, falling back to
+  `cmd /c echo %OS% %PROCESSOR_ARCHITECTURE%`), so a Windows server downloads `win32-x64`
+  (the CDN has no `win-x64`) instead of `linux-x64`; `--remote-arch` overrides the detection.
+  Windows servers using a POSIX default shell (Git Bash/MSYS/Cygwin) take the same command
+  path as Linux; `cmd`/PowerShell default shells are driven through
+  `powershell -EncodedCommand` (base64, no shell-quoting pitfalls).
 - Supported install channels (default `both`):
 
   | Channel | Local cache (Windows) | Local cache (other platforms) | Server cache (SSH) |
@@ -35,6 +41,8 @@ version each channel expects**, so local claude / codex just work.
   | Insiders | `~/AppData/Roaming/Code - Insiders/agent-host/sdk-cache/` | `~/.vscode-server-insiders/data/agent-host/sdk-cache/` | `~/.vscode-server-insiders/data/agent-host/sdk-cache/` |
   | Stable | `~/AppData/Roaming/Code/agent-host/sdk-cache/` | `~/.vscode-server/data/agent-host/sdk-cache/` | `~/.vscode-server/data/agent-host/sdk-cache/` |
 
+  On a Windows **server**, `~` is `%USERPROFILE%` (e.g.
+  `C:\Users\me\.vscode-server\data\agent-host\sdk-cache\`); on a Windows **client**, `~` is `%APPDATA%`.
   Actual layout: `<...>/sdk-cache/<tool>/<version>/<arch>/`, where arch is e.g. `win32-x64` / `linux-x64`.
 - Completion marker: after extraction + verification the script writes an empty `.complete` file under `<arch>/`,
   matching the agent-host native layout.
@@ -42,7 +50,8 @@ version each channel expects**, so local claude / codex just work.
 ## Requirements
 
 - Local: Python 3 (standard library only, zero dependencies); Windows 10 1803+ ships System32\tar.exe; network access to vscode-cdn.net
-- Server push: passwordless SSH (key configured in ~/.ssh), tar present on the server
+- Server push: passwordless SSH (key configured in ~/.ssh), tar present on the server;
+  Windows servers also need PowerShell and `System32\tar.exe` (Windows 10 1803+ / Server 2019+)
 
 ## Usage
 
@@ -57,7 +66,8 @@ python update_agent_sdk.py --server-only --server <alias>  # server push only
 
 | Argument | Description |
 |---|---|
-| `--server <SSH_ALIAS>` | SSH alias or `user@host` from ~/.ssh/config; pushes linux-x64 to the server when given |
+| `--server <SSH_ALIAS>` | SSH alias or `user@host` from ~/.ssh/config; pushes the SDK packages to the server, arch auto-detected (`linux-x64` / `win32-x64` / …) |
+| `--remote-arch <arch>` | force the server arch, skipping detection (e.g. `win32-x64`, `linux-arm64`) |
 | `--channel insiders\|stable\|both` | default `both` |
 | `--tool claude\|codex\|all` | default `all` |
 | `--branch <branch or tag>` | vscode repository branch/tag used as fallback when no installed `product.json` is found; default `main` (the Insiders line — for a stable install use `release/<x>`) |
@@ -71,7 +81,8 @@ on the server `~/.vscode-server` / `~/.vscode-server-insiders`) does not exist, 
 and **no directories are created for it**.
 **If the same version is already installed anywhere, it is not downloaded again**: when one local channel has it installed,
 other missing channels copy the installed directory directly (`robocopy` / `cp -a`, no download); the same holds on the server —
-if one server channel has it, the others reuse it via an in-server `cp -a`, so no linux package is downloaded.
+if one server channel has it, the others reuse it via an in-server copy (`cp -a` on POSIX, `Copy-Item` on Windows), so no package
+is downloaded; if that in-server copy fails, the script falls back to downloading.
 Only when no copy exists anywhere does the script do "download → stream-verify the in-package version field → extract → atomic
 rename → write `.complete`"; a package needed by multiple targets is downloaded only once (shared across local channels and
 server channels alike). Any failure cleans up temp artifacts; tools are independent, one failing does not block the other.
@@ -97,6 +108,10 @@ Linux server (when running directly on the server, it automatically uses the `~/
 ## FAQ
 
 - **`win-x64` gives 404**: the CDN arch name is `win32-x64` (the cache directory is `win32-x64` too); the script detects it automatically.
+- **I push to a Windows server**: the arch is detected as `win32-x64` / `win32-arm64` instead of `linux-x64`; the cache lives under
+  `%USERPROFILE%\.vscode-server[-insiders]\data\agent-host\sdk-cache`. Windows servers with a Git Bash default shell use the normal POSIX commands;
+  `cmd` / PowerShell shells go through `powershell -NoProfile -EncodedCommand`. If detection is wrong or unsupported, pass `--remote-arch win32-x64`.
+  The server needs `System32\tar.exe` (Windows 10 1803+ / Server 2019+) and PowerShell.
 - **The version directory exists but the SDK files are stale**: check whether the version verification failed in the logs; use `--dry-run` to see which version it intends to install.
 - **First download is slow**: claude ≈ 96MB, codex ≈ 133MB, roughly 1-3 minutes depending on your connection.
 - **Verify connectivity with `ssh <alias>` before a server push**.
