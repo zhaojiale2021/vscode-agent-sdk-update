@@ -1,0 +1,25 @@
+[MAIN]
+# 中文注释按字符数算,120 与实际观感相当
+max-line-length=120
+# 单文件是刻意设计(拷一个文件就能跑),所以放宽模块行数
+max-module-lines=1400
+
+[MESSAGES CONTROL]
+disable=
+    duplicate-code,               # POSIX 与 Windows 两套命令是刻意对称的
+    too-many-arguments,           # remote_* / collect_specs 的参数就是远端上下文
+    too-many-positional-arguments,
+    too-many-locals,
+    too-many-branches,
+
+[FORMAT]
+indent-string='    '
+
+[DESIGN]
+max-args=8
+max-positional-arguments=8
+
+[REPORTS]
+# 只在有问题时输出,CI 里好读
+reports=no
+score=no

@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONIOENCODING: utf-8          # 代码/输出里有中文, Windows runner 默认 GBK 会乱码
+
+jobs:
+  lint:
+    name: pylint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pylint update_agent_sdk.py tests
+
+  test:
+    name: pytest (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements-dev.txt
+      # POSIX 命令真跑(ubuntu 的 sh)、Windows 的 PowerShell 命令真跑(windows runner),
+      # 每个系统各自覆盖自己那套;两边都不会联网。
+      - run: python -m pytest -q
+      - name: CLI 冒烟(未装 VS Code 时应静默跳过)
+        run: python update_agent_sdk.py --dry-run --local-only
