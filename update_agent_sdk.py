@@ -26,11 +26,13 @@ import base64
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -58,8 +60,11 @@ CHANNELS = {
 }
 CHANNEL_LABEL = {"insiders": "Insiders", "stable": "Stable"}
 
-USER_AGENT = "agent-sdk-updater/1.3"
-CHUNK = 1 << 20  # 1 MiB
+USER_AGENT = "agent-sdk-updater/1.4"
+CHUNK = 1 << 18            # 256 KiB 分块:小块读更容易发现「不发数据了」
+DOWNLOAD_ATTEMPTS = 10     # CDN 传到一半断流是常见的,带 Range 续传慢慢下完
+UPLOAD_ATTEMPTS = 3        # scp 偶发被远端残留文件/连接抖动打断
+READ_TIMEOUT = 60          # 单次 socket 读超时:卡住时快速失败重试,而不是干等
 
 
 class ScriptError(Exception):
@@ -67,36 +72,99 @@ class ScriptError(Exception):
 
 
 def err(msg):
+    """把用户可读错误打到 stderr。"""
     print(f"错误: {msg}", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------- HTTP
 
-def http_download(url, dest: Path, timeout=900):
+def _download_once(url, dest: Path):
+    """下载或续传一次;没收到完整长度就抛 OSError(由调用方决定重试)。
+
+    已下的部分保留在 dest,下一次用 Range 从断点接着下 —— CDN 传大包时
+    中途不再发数据是常态,每次都从头来会永远下不完。
+    """
+    have = dest.stat().st_size if dest.exists() else 0
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    if have:
+        req.add_header("Range", f"bytes={have}-")
+    with urllib.request.urlopen(req, timeout=READ_TIMEOUT) as resp:
+        if getattr(resp, "status", 200) == 206:      # 服务端支持续传
+            total, mode = have + int(resp.headers.get("Content-Length") or 0), "ab"
+        else:                                        # 不支持 Range: 只能重下
+            have, total, mode = 0, int(resp.headers.get("Content-Length") or 0), "wb"
+        done, last_pct = have, (have * 100 // total if total else 0)
+        with open(dest, mode) as f:
+            while True:
+                chunk = resp.read(CHUNK)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if total:
+                    pct = done * 100 // total
+                    if pct >= last_pct + 10:         # 每 10% 报一次进度
+                        last_pct = pct
+                        print(f"  …{pct}%", flush=True)
+                    if done >= total:
+                        break
+    if total and done > total:                       # 服务端多发就截断到声明长度
+        with open(dest, "rb+") as f:
+            f.truncate(total)
+        done = total
+    if total and done != total:
+        raise OSError(f"连接中断(收到 {done}/{total} 字节)")
+
+
+def http_size(url, timeout=30):
+    """HEAD 拿 Content-Length(拿不到返回 0)。用于判断已下的是不是完整包。"""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT}, method="HEAD")
     try:
-        resp = urllib.request.urlopen(req, timeout=timeout)
-    except urllib.error.HTTPError as e:
-        raise ScriptError(f"下载失败 {e.code}: {url}")
-    except urllib.error.URLError as e:
-        raise ScriptError(f"下载失败 {url}: {e.reason}")
-    with resp, open(dest, "wb") as f:
-        while True:
-            chunk = resp.read(CHUNK)
-            if not chunk:
-                break
-            f.write(chunk)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return int(resp.headers.get("Content-Length") or 0)
+    except (urllib.error.URLError, OSError, ValueError):
+        return 0
+
+
+def http_download(url, dest: Path, attempts=DOWNLOAD_ATTEMPTS):
+    """流式下载 url 到 dest,断了就从断点续传重试。
+
+    单次读超时设短(READ_TIMEOUT)以便卡住时快速失败;每次重试都接着已下部分
+    继续,所以链路一直抖也能慢慢下完;但连续两次一次字节都没多,说明对面不是
+    抖动而是真不给,提前放弃。4xx 是永久的(比如 arch 名写错),不重试。
+    """
+    last, stalled = None, 0
+    size = dest.stat().st_size if dest.exists() else 0
+    for attempt in range(1, attempts + 1):
+        try:
+            _download_once(url, dest)
+            return
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                raise ScriptError(f"下载失败 {e.code}: {url}") from e
+            last = e
+        except (urllib.error.URLError, OSError) as e:
+            last = e
+        grown = dest.stat().st_size if dest.exists() else 0
+        stalled = 0 if grown > size else stalled + 1
+        size = grown
+        if stalled >= 2:
+            break
+        if attempt < attempts:
+            print(f"  下载中断({last}),已下 {size / 1048576:.1f} MB,接着下({attempt})…", flush=True)
+    raise ScriptError(f"下载失败 {url}: {last}")
 
 
 def http_get_text(url, timeout=60):
+    """取回 URL 文本(版本查询用,内容不大)。"""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
-        raise ScriptError(f"获取失败 {e.code}: {url}")
+        raise ScriptError(f"获取失败 {e.code}: {url}") from e
     except urllib.error.URLError as e:
-        raise ScriptError(f"获取失败 {url}: {e.reason}")
+        raise ScriptError(f"获取失败 {url}: {e.reason}") from e
 
 
 # ---------------------------------------------------------------- 版本
@@ -133,12 +201,12 @@ def _parse_pkg_text(text):
     try:
         obj = json.loads(text)
     except json.JSONDecodeError as e:
-        raise ScriptError(f"package.json 解析失败: {e}")
+        raise ScriptError(f"package.json 解析失败: {e}") from e
     if isinstance(obj, dict) and "content" in obj and "dependencies" not in obj:
         try:
             obj = json.loads(base64.b64decode(obj["content"]).decode("utf-8"))
         except (json.JSONDecodeError, ValueError) as e:
-            raise ScriptError(f"package.json 解码失败: {e}")
+            raise ScriptError(f"package.json 解码失败: {e}") from e
     return obj
 
 
@@ -240,7 +308,7 @@ def resolve_versions(product, channel, tools, branch, memo):
         try:
             ver = branch_versions(memo, branch).get(tool)
         except ScriptError as e:
-            raise ScriptError(f"[{tool}] 无可用版本来源: {e}")
+            raise ScriptError(f"[{tool}] 无可用版本来源: {e}") from e
         if not ver:
             raise ScriptError(f"[{tool}] vscode {branch} 的 package.json 中没有 {TOOL_NPM[tool]}")
         hint = " (警告: main 实际是 Insiders 行,若目标是 stable 请用 --branch release/<x>)" \
@@ -248,25 +316,6 @@ def resolve_versions(product, channel, tools, branch, memo):
         result[tool] = (ver, f"vscode {branch} devDependencies{hint}")
     return result
 
-
-def local_arch():
-    system = platform.system()
-    machine = platform.machine().lower()
-    mapping = {
-        ("Windows", ("amd64", "x86_64")): "win32-x64",
-        ("Windows", ("arm64", "aarch64")): "win32-arm64",
-        ("Linux", ("x86_64", "amd64")): "linux-x64",
-        ("Linux", ("aarch64", "arm64")): "linux-arm64",
-        ("Darwin", ("arm64", "aarch64")): "darwin-arm64",
-        ("Darwin", ("x86_64", "amd64")): "darwin-x64",
-    }
-    for (sys_, machines), arch in mapping.items():
-        if system == sys_ and machine in machines:
-            return arch
-    raise ScriptError(f"无法识别的平台: {system}/{machine}")
-
-
-# ---------------------------------------------------------------- 远程平台探测
 
 # 机器名 → CDN/缓存目录用的 arch 名(CDN 上只有 win32-x64, 没有 win-x64)
 ARCH_BY_MACHINE = {
@@ -279,61 +328,106 @@ ARCH_BY_MACHINE = {
 }
 
 
-class Remote:
-    """SSH 服务器探测结果: 系统 / 架构 / 默认 shell 能否直接跑 POSIX 命令。
+def arch_of(os_name, machine):
+    """(系统, 机器名) → arch; 不认识的组合返回 None。"""
+    return ARCH_BY_MACHINE.get(os_name or "", {}).get((machine or "").lower())
 
-    posix_shell=True: Linux / macOS / Windows 上的 Git Bash(MSYS/Cygwin)等,
-    可直接用 $HOME + find/cat/tar/mkdir/mv/touch;
-    posix_shell=False: Windows 的 cmd / PowerShell 默认 shell, 改走
-    powershell -EncodedCommand(base64)执行, 绕开 cmd → PowerShell 的双层引号解析。
+
+def local_arch():
+    """本机 arch(与远端探测共用 ARCH_BY_MACHINE, 保持两边口径一致)。"""
+    os_name = {"win32": "windows", "darwin": "darwin", "linux": "linux"}.get(sys.platform)
+    system, machine = platform.system(), platform.machine()
+    arch = arch_of(os_name, machine)
+    if not arch:
+        raise ScriptError(f"无法识别的平台: {system}/{machine}")
+    return arch
+
+
+# ---------------------------------------------------------------- 远程平台探测
+
+
+class Remote:
+    """SSH 服务器探测结果。
+
+    Windows 一律走 PowerShell(默认 shell 是 cmd / PowerShell / Git Bash 都能调起
+    powershell.exe), 用 -EncodedCommand(base64)执行, 绕开多层引号解析;
+    其余系统走 POSIX shell 命令($HOME + find/cat/tar/mkdir/mv/touch)。
     """
 
-    def __init__(self, os_name, arch, posix_shell):
+    def __init__(self, os_name, arch):
+        """os_name: linux/darwin/windows;arch: CDN 与缓存目录用的架构名。"""
         self.os = os_name              # linux / darwin / windows
         self.arch = arch               # linux-x64 / win32-x64 / ...
-        self.posix_shell = posix_shell
+
+    @property
+    def is_windows(self):
+        """Windows 服务器(决定走 PowerShell 还是 POSIX 命令)。"""
+        return self.os == "windows"
 
     def __str__(self):
-        return f"{self.os}/{self.arch}, {'POSIX shell' if self.posix_shell else 'PowerShell'}"
+        """日志里显示的简短描述。"""
+        return f"{self.os}/{self.arch}"
+
+
+def _ssh_try(server, cmd):
+    """探测用: 返回 (stdout, 错误文本), 不抛异常。"""
+    try:
+        return ssh_run(server, cmd), ""
+    except ScriptError as e:
+        return "", str(e)
+
+
+def _parse_uname(out):
+    """解析 `uname -s; uname -m` 输出, 返回 (系统, 架构);认不出返回 (None, "")。
+
+    按关键词而不是按行取值: Windows 上常见的 coreutils uname 不认参数(实测
+    10.0.12.44 上 `uname -s`/`uname -m` 都输出 `Windows_NT 10.0`),Linux 上也可能
+    被换成打印整行的实现。
+    """
+    text = (out or "").lower()
+    if any(k in text for k in ("mingw", "msys", "cygwin", "ucrt", "windows")):
+        os_name = "windows"
+    elif "linux" in text:
+        os_name = "linux"
+    elif "darwin" in text:
+        os_name = "darwin"
+    else:
+        return None, ""
+    machine = next((t for t in re.split(r"[\s/()]+", text) if t in ARCH_BY_MACHINE[os_name]), "")
+    return os_name, machine
+
+
+def _parse_windows_probe(out):
+    """解析 `cmd /c echo %OS% %PROCESSOR_ARCHITECTURE%` 输出, 非 Windows 返回 (None, "")。"""
+    parts = (out or "").split()
+    if parts and parts[0].upper() == "WINDOWS_NT":
+        return "windows", (parts[1].lower() if len(parts) > 1 else "")
+    return None, ""
 
 
 def detect_remote(server, arch_override=""):
-    """探测服务器系统与架构: 先 uname(覆盖 Linux/macOS/Git Bash), 失败再走 cmd。
+    """探测服务器系统与架构。
 
-    Windows 服务器必须按 win32-x64/win32-arm64 下载(CDN 没有 win-x64);
-    Git Bash / MSYS / Cygwin 的 uname 报 MINGW64_NT… 之类, 归为 Windows 但仍是
-    POSIX shell; cmd/PowerShell 默认 shell 的 Windows 归为非 POSIX。
+    先 uname(Linux/macOS/Git Bash 一次到位);认不出系统、或 Windows 上拿不到架构时,
+    再用 `cmd /c echo %OS% %PROCESSOR_ARCHITECTURE%` 兜底 —— 这条在 Windows 的
+    cmd / PowerShell 默认 shell 下都成立。Windows 必须按 win32-x64/win32-arm64
+    下载(CDN 上没有 win-x64)。
     """
-    ssh_err = ""
-    try:
-        out = ssh_run(server, "uname -s; uname -m")
-    except ScriptError as e:
-        ssh_err, out = str(e), None
-    if out:
-        parts = [l.strip() for l in out.splitlines() if l.strip()]
-        sysname = parts[0].lower() if parts else ""
-        machine = parts[1].lower() if len(parts) > 1 else ""
-        if sysname.startswith(("mingw", "msys", "cygwin", "ucrt")):
-            os_name, posix_shell = "windows", True
-        elif sysname in ("linux", "darwin"):
-            os_name, posix_shell = sysname, True
-        else:
-            raise ScriptError(f"无法识别的服务器系统: {sysname!r}(uname -s);"
-                              f"可用 --remote-arch 手动指定架构")
-    else:
-        try:
-            out = ssh_run(server, "cmd /c echo %OS% %PROCESSOR_ARCHITECTURE%")
-        except ScriptError:
-            out = ""
-        parts = (out or "").split()
-        if not parts or parts[0].upper() != "WINDOWS_NT":
-            raise ScriptError(f"无法探测服务器平台: {ssh_err or 'uname / cmd 均无有效输出'}")
-        os_name, posix_shell = "windows", False
-        machine = parts[1].lower() if len(parts) > 1 else ""
-    arch = arch_override or ARCH_BY_MACHINE.get(os_name, {}).get(machine)
+    out, uname_err = _ssh_try(server, "uname -s; uname -m")
+    os_name, machine = _parse_uname(out)
+    if os_name is None or (os_name == "windows" and not arch_of(os_name, machine)):
+        cmd_out, cmd_err = _ssh_try(server, "cmd /c echo %OS% %PROCESSOR_ARCHITECTURE%")
+        cmd_os, cmd_machine = _parse_windows_probe(cmd_out)
+        if cmd_os:
+            os_name, machine = cmd_os, cmd_machine
+        elif os_name is None:
+            raise ScriptError("无法探测服务器平台: "
+                              + (uname_err or cmd_err or "uname / cmd 均无有效输出")
+                              + "(可用 --remote-arch 手动指定架构)")
+    arch = arch_override or arch_of(os_name, machine)
     if not arch:
         raise ScriptError(f"无法识别的服务器架构: {os_name}/{machine}(可用 --remote-arch 指定)")
-    return Remote(os_name, arch, posix_shell)
+    return Remote(os_name, arch)
 
 
 # ---------------------------------------------------------------- 路径(不暴露用户名)
@@ -364,8 +458,10 @@ def local_channel_exists(channel: str, local_root) -> bool:
 # ---------------------------------------------------------------- 校验/解压(复用系统 tar,规避 Windows 长路径问题)
 
 def find_tar():
+    """定位 tar:Windows 优先用自带 bsdtar(支持长路径),其余平台走 PATH。"""
     if sys.platform == "win32":
-        # 优先 Win10+ 自带的 bsdtar(支持超长路径),Git Bash 的 "/usr/bin/tar" 无法被 CreateProcess 直接执行
+        # 优先 Win10+ 自带的 bsdtar(支持超长路径);
+        # Git Bash 的 "/usr/bin/tar" 无法被 CreateProcess 直接执行
         cand = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "tar.exe"
         if cand.is_file():
             return str(cand)
@@ -376,12 +472,13 @@ def find_tar():
 
 
 def run_tar(args):
+    """执行 tar 并返回 stdout;非 0 退出转成用户可读错误。"""
     tar = find_tar()
     try:
         p = subprocess.run([str(tar)] + args, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace")
+                           encoding="utf-8", errors="replace", check=False)
     except OSError as e:
-        raise ScriptError(f"无法运行 tar: {e}")
+        raise ScriptError(f"无法运行 tar: {e}") from e
     if p.returncode != 0:
         raise ScriptError(f"tar 失败({' '.join(args)}): {p.stderr.strip() or p.stdout.strip()}")
     return p.stdout
@@ -400,8 +497,8 @@ def verify_tgz(tgz: Path, npm: str, expected: str):
     out = run_tar(["-x", "-O", "-z", "-f", str(tgz), member])
     try:
         actual = json.loads(out).get("version")
-    except json.JSONDecodeError:
-        raise ScriptError(f"{tgz.name} 中 {member} 不是合法 JSON")
+    except json.JSONDecodeError as e:
+        raise ScriptError(f"{tgz.name} 中 {member} 不是合法 JSON") from e
     if actual != expected:
         raise ScriptError(f"版本校验失败:{tgz.name} 内 {npm} 的 version={actual},期望 {expected}")
 
@@ -409,25 +506,65 @@ def verify_tgz(tgz: Path, npm: str, expected: str):
 # ---------------------------------------------------------------- 下载缓存(同一版本包在多个 channel 间复用)
 
 class TgzCache:
-    """按 (tool, version, arch) 缓存已下载并校验过的 tgz, 避免 stable/insiders 重复下载。"""
+    """按 (tool, version, arch) 缓存下载过的 tgz,同一版本包只下一次、跨次运行也复用。
 
-    def __init__(self):
-        self._dir = Path(tempfile.mkdtemp(prefix="agent-sdk-tgz-"))
+    目录放在系统临时目录且退出时不删:这个 CDN 经常传到一半断流,留着已下部分
+    下次能接着下(http_download 用 Range 续传);已下完的包也省得再下一遍。
+    过期文件(默认 30 天)在启动时清掉,不至于一直堆着。
+    """
+
+    TTL_DAYS = 30
+
+    def __init__(self, root=None):
+        """缓存目录默认 <系统临时目录>/agent-sdk-tgz-cache。"""
+        self._dir = Path(root) if root else Path(tempfile.gettempdir()) / "agent-sdk-tgz-cache"
+        self._dir.mkdir(parents=True, exist_ok=True)
         self._paths = {}
+        self._prune()
+
+    def _prune(self):
+        """删掉过期的包(系统临时目录也可能被系统自己清理,所以删除失败无所谓)。"""
+        cutoff = time.time() - self.TTL_DAYS * 86400
+        for old in self._dir.glob("*.tgz"):
+            try:
+                if old.stat().st_mtime < cutoff:
+                    old.unlink()
+            except OSError:
+                pass
+
+    def _state(self, tgz: Path, url: str, tool: str, version: str):
+        """已存在文件的处置: done(可复用)/ resume(留着续传)/ discard(删掉重下)。"""
+        if tgz.stat().st_size < http_size(url):
+            return "resume"                       # 比远端小 → 上次没下完,接着下
+        try:
+            verify_tgz(tgz, TOOL_NPM[tool], version)
+            return "done"
+        except ScriptError:
+            return "discard"
 
     def get(self, tool, version, arch):
+        """取该组合的本地 tgz;没有就下载并校验,同一组合只下一次。"""
         key = (tool, version, arch)
-        if key not in self._paths:
-            tgz = self._dir / f"{tool}-{version}-{arch}.tgz"
-            url = CDN_URL.format(tool=tool, version=version, arch=arch)
+        if key in self._paths:
+            return self._paths[key]
+        tgz = self._dir / f"{tool}-{version}-{arch}.tgz"
+        url = CDN_URL.format(tool=tool, version=version, arch=arch)
+        state = self._state(tgz, url, tool, version) if tgz.is_file() else "discard"
+        if state == "done":
+            print(f"  复用已下载的 {tgz.name}", flush=True)
+        else:
+            if state == "discard":
+                tgz.unlink(missing_ok=True)
+            else:
+                print(f"  续传上次没下完的 {tgz.name}(已下 {tgz.stat().st_size / 1048576:.1f} MB)", flush=True)
             print(f"  下载 {url}", flush=True)
             http_download(url, tgz)
-            verify_tgz(tgz, TOOL_NPM[tool], version)
-            self._paths[key] = tgz
-        return self._paths[key]
+        verify_tgz(tgz, TOOL_NPM[tool], version)
+        self._paths[key] = tgz
+        return tgz
 
     def cleanup(self):
-        shutil.rmtree(self._dir, ignore_errors=True)
+        """不需要清理: 缓存跨次运行复用(交给 TTL 与系统临时目录策略回收)。"""
 
 
 # ---------------------------------------------------------------- 目录复制(已有安装直接复用,免下载)
@@ -441,9 +578,10 @@ def copy_tree(src: Path, dst: Path):
     else:
         args = ["cp", "-a", str(src) + os.sep, str(dst)]
     try:
-        p = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        p = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", check=False)
     except OSError as e:
-        raise ScriptError(f"无法运行目录复制({args[0]}): {e}")
+        raise ScriptError(f"无法运行目录复制({args[0]}): {e}") from e
     if sys.platform == "win32":
         ok = p.returncode <= 7          # robocopy 0-7 均表示成功(1=有复制)
     else:
@@ -453,7 +591,10 @@ def copy_tree(src: Path, dst: Path):
 
 
 def find_local_source(roots, tool: str, version: str, arch: str):
-    """在其他通道的缓存根目录里找已完整安装的 (tool, version, arch),找到则免下载直接复用。"""
+    """在其他通道的缓存根目录里找已完整安装的 (tool, version, arch)。
+
+    找到就免下载直接复用(.complete 与 node_modules 都在才算完整)。
+    """
     for root in roots:
         cand = root / tool / version / arch
         if (cand / ".complete").is_file() and (cand / "node_modules").is_dir():
@@ -491,7 +632,9 @@ def install_local(root: Path, tool: str, version: str, arch: str, cache: TgzCach
 
         os.replace(ready, target)          # 同盘改名,近乎原子
         (target / ".complete").touch()
-        return "已更新(复用已有的同版本副本)" if src is not None else "已更新(解压校验完成,.complete 已写入)"
+        if src is not None:
+            return "已更新(复用已有的同版本副本)"
+        return "已更新(解压校验完成,.complete 已写入)"
     except BaseException:
         if tmp is not None and not target.exists():  # 失败时清理,避免半成品留在缓存
             shutil.rmtree(tmp, ignore_errors=True)
@@ -503,24 +646,51 @@ def install_local(root: Path, tool: str, version: str, arch: str, cache: TgzCach
 
 # ---------------------------------------------------------------- 远程推送
 
-def ssh_run(server: str, cmd: str, stdin_path=None):
-    """执行远端命令;stdin_path 非空时把本地文件接到远端 stdin(用于传 tgz)。"""
+def ssh_run(server: str, cmd: str):
+    """执行远端命令(默认 shell 会先解析一遍命令串,所以命令要兼容 cmd/PowerShell/sh)。"""
     try:
-        if stdin_path is None:
-            p = subprocess.run(["ssh", server, cmd], capture_output=True, text=True,
-                               encoding="utf-8", errors="replace")
-        else:
-            with open(stdin_path, "rb") as f:
-                p = subprocess.run(["ssh", server, cmd], stdin=f, capture_output=True,
-                                   text=True, encoding="utf-8", errors="replace")
+        p = subprocess.run(["ssh", server, cmd], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", check=False)
     except OSError as e:
-        raise ScriptError(f"无法运行 ssh(或读取待传文件): {e}")
+        raise ScriptError(f"无法运行 ssh: {e}") from e
     if p.returncode != 0:
         raise ScriptError(f"ssh {server} 失败: {p.stderr.strip() or p.stdout.strip() or str(p.returncode)}")
     return p.stdout.strip()
 
 
-def ssh_run_ps(server: str, body: str, stdin_path=None):
+def _scp_once(server: str, local: Path, name: str):
+    """scp 一次;失败转成 ScriptError。"""
+    try:
+        p = subprocess.run(["scp", str(local), f"{server}:{name}"], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", check=False)
+    except OSError as e:
+        raise ScriptError(f"无法运行 scp: {e}") from e
+    if p.returncode != 0:
+        raise ScriptError(f"scp 上传 {name} 失败: {p.stderr.strip() or p.stdout.strip()}")
+
+
+def scp_push(server: str, local: Path, name: str, attempts=UPLOAD_ATTEMPTS):
+    """用 scp 把文件传到服务器用户目录下,失败重试。
+
+    目标写成相对文件名: scp/sftp 相对各自家目录解析(POSIX 是 $HOME,Windows 是
+    %USERPROFILE%),既避开 /tmp 与盘符差异,也是实测在 Windows 服务器上稳定的
+    方式(把 tgz 灌进 ssh 的 stdin 会卡住)。远端若还留着同名文件、被残留进程
+    占着,scp 会报 `dest open ... Failure` —— 调用方会先删掉它,这里再兜底重试。
+    """
+    last = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            _scp_once(server, local, name)
+            return
+        except ScriptError as e:
+            last = str(e).strip().splitlines()[-1] if str(e).strip() else "未知错误"
+            if attempt < attempts:
+                print(f"  上传失败({last[:70]}),重试 {attempt}/{attempts - 1}…", flush=True)
+                time.sleep(attempt * 2)
+    raise ScriptError(f"scp 上传 {name} 失败: {last}")
+
+
+def ssh_run_ps(server: str, body: str):
     """在服务器上执行 PowerShell 脚本(base64(UTF-16LE) + -EncodedCommand)。
 
     直接 `ssh server powershell -Command "…"` 会先被默认 shell(cmd/PowerShell)
@@ -533,7 +703,7 @@ def ssh_run_ps(server: str, body: str, stdin_path=None):
               "catch {\n  [Console]::Error.WriteLine($_.Exception.Message)\n  exit 1\n}\n"
               "exit 0")
     enc = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
-    return ssh_run(server, f"powershell -NoProfile -EncodedCommand {enc}", stdin_path)
+    return ssh_run(server, f"powershell -NoProfile -EncodedCommand {enc}")
 
 
 def _ps_lit(text):
@@ -558,7 +728,7 @@ def _sdk_rel(tool: str, channel: str, version: str, remote: Remote):
 
 def _remote_test(server: str, remote: Remote, posix_cond: str, ps_expr: str) -> bool:
     """在服务器上判断「路径存在」类条件, 返回布尔(posix_cond 是 [ -f x ] 之类)。"""
-    if remote.posix_shell:
+    if not remote.is_windows:
         return ssh_run(server, f"if {posix_cond}; then echo YES; else echo NO; fi") == "YES"
     return ssh_run_ps(server, "if (Test-Path -LiteralPath " + ps_expr + ") { 'YES' } else { 'NO' }") == "YES"
 
@@ -635,7 +805,7 @@ def _parse_product_text(text):
 
 def remote_read_product(server: str, remote: Remote, channel: str):
     """读服务器上该通道最新的 product.json(取不到返回 None,不致命)。"""
-    if remote.posix_shell:
+    if not remote.is_windows:
         for path in ssh_find_products(server, channel):
             try:
                 text = ssh_run(server, f'cat -- "{path}"')
@@ -712,6 +882,7 @@ def _ps_finish(tool: str, action: str):
 
 
 def _ps_install_script(tool: str, rel: str, tgz_name: str):
+    """PowerShell 版安装: 解压 tgz 到 <arch>.tmp → 校验 → 改名 → 写 .complete。"""
     return ("$tar = Join-Path $env:SystemRoot 'System32/tar.exe'\n"
             "if (-not (Test-Path -LiteralPath $tar)) "
             "{ throw '服务器缺少 System32\\tar.exe(需 Windows 10 1803+ / Server 2019+)' }\n"
@@ -723,6 +894,7 @@ def _ps_install_script(tool: str, rel: str, tgz_name: str):
 
 
 def _ps_copy_script(tool: str, rel: str, src_rel: str):
+    """PowerShell 版复用: 服务器内复制同版本已装副本到另一个通道。"""
     return ("$src = " + _win(src_rel) + "\n"
             "if (-not (Test-Path -LiteralPath (Join-Path $src 'node_modules/" + TOOL_NPM[tool] + "/package.json'))) "
             "{ throw '源副本不完整: ' + $src }\n"
@@ -732,39 +904,55 @@ def _ps_copy_script(tool: str, rel: str, src_rel: str):
 
 
 def remote_install(server: str, remote: Remote, tool: str, channel: str, version: str, tgz_name: str):
+    """在服务器上安装 <tool>/<version>/<arch>(tgz_name 需已传到服务器用户目录)。"""
     rel = _sdk_rel(tool, channel, version, remote)
-    if remote.posix_shell:
+    if not remote.is_windows:
         ssh_run(server, _posix_install_cmd(tool, rel, _posix(tgz_name)))
     else:
         ssh_run_ps(server, _ps_install_script(tool, rel, tgz_name))
 
 
 def remote_copy(server: str, remote: Remote, tool: str, dst_channel: str, src_channel: str, version: str):
+    """服务器内把 src_channel 已装好的同版本副本复制到 dst_channel。"""
     rel = _sdk_rel(tool, dst_channel, version, remote)
     src_rel = _sdk_rel(tool, src_channel, version, remote)
-    if remote.posix_shell:
+    if not remote.is_windows:
         ssh_run(server, _posix_copy_cmd(tool, rel, src_rel))
     else:
         ssh_run_ps(server, _ps_copy_script(tool, rel, src_rel))
 
 
-def remote_put(server: str, remote: Remote, local: Path, name: str):
-    """把 tgz 放到服务器用户目录下(<name>);Windows 走 PowerShell 接收 stdin。
+def remote_put(server: str, local: Path, name: str):
+    """把 tgz 传到服务器用户目录下(解压脚本里用 $HOME/%USERPROFILE% 引用)。"""
+    scp_push(server, local, name)
 
-    不走 scp: Windows 上 sftp 的路径语义(/tmp、盘符)与哪种默认 shell 都难对齐,
-    直接由远端 shell 自己决定落到哪(都在 $HOME / %USERPROFILE% 下)。
+
+def upload_tgz(server: str, remote: Remote, tgz: Path, tool: str, ver: str):
+    """上传 tgz 并返回服务器上的文件名;首选名字不可用就换个带 pid 的名字。
+
+    远端可能留着上次中断的残留文件,若还被某个进程占着(mv/删除都会失败),
+    scp 就写不进去 —— 换个名字绕过它,别让一次残留拖死整轮更新。
     """
-    if remote.posix_shell:
-        ssh_run(server, f'cat > "$HOME/{name}"', stdin_path=local)
-    else:
-        ssh_run_ps(server,
-                   "$out = [IO.File]::Create(" + _win(name) + ")\n"
-                   "try { [Console]::OpenStandardInput().CopyTo($out) } finally { $out.Close() }",
-                   stdin_path=local)
+    last = ""
+    names = (f"agent-sdk-{tool}-{ver}.tgz", f"agent-sdk-{tool}-{ver}-{os.getpid()}.tgz")
+    for name in names:
+        try:
+            remote_rm(server, remote, name)          # 先清掉同名残留(失败不致命)
+        except ScriptError:
+            pass
+        print(f"  上传 {name}({tgz.stat().st_size / 1048576:.1f} MB)→ {server}:~/{name}", flush=True)
+        try:
+            remote_put(server, tgz, name)
+            return name
+        except ScriptError as e:
+            last = str(e)
+            print(f"  警告: {last.splitlines()[-1][:90]}", flush=True)
+    raise ScriptError(f"上传 {tool} {ver} 失败: {last}")
 
 
 def remote_rm(server: str, remote: Remote, name: str):
-    if remote.posix_shell:
+    """删除上传的临时 tgz(不存在不算错)。"""
+    if not remote.is_windows:
         ssh_run(server, f'rm -f -- "$HOME/{name}"')
     else:
         ssh_run_ps(server, "Remove-Item -LiteralPath " + _win(name)
@@ -817,8 +1005,7 @@ def push_server(server: str, tool: str, specs: dict, cache: TgzCache, remote: Re
         for ver, group in by_ver.items():
             tgz = cache.get(tool, ver, remote.arch)
             name = f"agent-sdk-{tool}-{ver}.tgz"
-            print(f"  上传 {name}({tgz.stat().st_size / 1048576:.1f} MB)→ {server}:~/{name}", flush=True)
-            remote_put(server, remote, tgz, name)
+            name = upload_tgz(server, remote, tgz, tool, ver)
             uploaded.append(name)
             for c in group:
                 remote_install(server, remote, tool, c, ver, name)
@@ -835,6 +1022,7 @@ def push_server(server: str, tool: str, specs: dict, cache: TgzCache, remote: Re
 # ---------------------------------------------------------------- 主流程
 
 def plan_local(root: Path, tool: str, version: str, arch: str, sources):
+    """dry-run: 描述本机这一步会做什么。"""
     target = root / tool / version / arch
     if target.exists():
         return "已是最新(跳过)"
@@ -858,11 +1046,8 @@ def plan_server(server: str, tool: str, specs: dict, remote: Remote):
     return statuses
 
 
-def main():
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
-
+def build_parser():
+    """命令行参数定义。"""
     ap = argparse.ArgumentParser(
         description="更新 VS Code agent-host 的 SDK 缓存(claude/codex,stable+Insiders),"
                     "版本按通道取「实际」对应关系(已安装 VS Code product.json 的 agentSdks,"
@@ -888,8 +1073,84 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="只报告打算做什么,不落盘")
     ap.add_argument("--local-only", action="store_true", help="只更新本机,跳过远程")
     ap.add_argument("--server-only", action="store_true", help="只推远程,忽略本机")
-    args = ap.parse_args()
+    return ap
 
+
+def collect_specs(side, channels, tools, branch, memo, is_installed, read_product, missing_hint):
+    """解析一侧(本机/服务器)各通道「实际」期望的版本。
+
+    is_installed(channel) 判断通道是否装了;read_product(channel) 取该通道的
+    product.json(取不到给 None);missing_hint(channel) 用于未安装时的提示文案。
+    返回 ({channel: {tool: (版本, 来源)}}, 失败数)。
+    """
+    specs_by_channel, failures = {}, 0
+    for channel in channels:
+        label = CHANNEL_LABEL[channel]
+        if not is_installed(channel):
+            print(f"  {side}[{label}]: 通道未安装(无 {missing_hint(channel)} 目录),跳过", flush=True)
+            continue
+        try:
+            specs = resolve_versions(read_product(channel), channel, tools, branch, memo)
+        except ScriptError as e:
+            err(f"[{side} {label}] {e}")
+            failures += 1
+            continue
+        specs_by_channel[channel] = specs
+        print(f"  {side}[{label}] 期望: " + " · ".join(
+            f"{t} {v}({s})" for t, (v, s) in specs.items()), flush=True)
+    return specs_by_channel, failures
+
+
+def update_local(specs_by_channel, tools, local_root, dry_run, cache):
+    """按通道把 SDK 装到本机(或 dry-run 预览);返回失败数。"""
+    failures = 0
+    if not specs_by_channel:
+        return failures
+    arch = local_arch()
+    sources = [local_root or default_local_root(c) for c in CHANNELS]
+    for tool in tools:
+        for channel, specs in specs_by_channel.items():
+            ver, _ = specs[tool]
+            root = local_root or default_local_root(channel)
+            label = CHANNEL_LABEL[channel]
+            try:
+                status = plan_local(root, tool, ver, arch, sources) if dry_run \
+                    else install_local(root, tool, ver, arch, cache, sources)
+            except ScriptError as e:
+                err(f"[本机 {label} {tool}] {e}")
+                failures += 1
+                continue
+            print(f"  本机[{label}]: {status}", flush=True)
+    return failures
+
+
+def update_server(server, remote, specs_by_channel, tools, dry_run, cache):
+    """把 SDK 推到服务器(或 dry-run 预览);返回失败数。"""
+    failures = 0
+    if not specs_by_channel:
+        return failures
+    for tool in tools:
+        specs_tool = {c: specs[tool][0] for c, specs in specs_by_channel.items()}
+        try:
+            statuses = plan_server(server, tool, specs_tool, remote) if dry_run \
+                else push_server(server, tool, specs_tool, cache, remote)
+        except ScriptError as e:
+            err(f"[服务器 {tool}] {e}")
+            failures += 1
+            continue
+        for channel in specs_by_channel:
+            print(f"  服务器[{CHANNEL_LABEL[channel]}]: {statuses[channel]}", flush=True)
+    return failures
+
+
+def main(argv=None):
+    """命令行入口;返回退出码(0 全部成功,1 有失败)。"""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+    ap = build_parser()
+    args = ap.parse_args(argv)
     if args.server_only and not args.server:
         ap.error("--server-only 需要同时指定 --server")
     if args.server_only and args.local_only:
@@ -899,91 +1160,46 @@ def main():
     channels = ["insiders", "stable"] if args.channel == "both" else [args.channel]
     do_local = not args.server_only
     do_remote = bool(args.server) and not args.local_only
-
+    memo = {}                     # branch → {tool: 版本},避免同一分支重复请求
     failures = 0
+
+    # ---- 1. 每个通道先解析「实际」期望版本(本机读安装 product.json,服务器 SSH 读) ----
+    local_specs = {}              # channel -> {tool: (版本, 来源)}
+    if do_local:
+        local_specs, n_fail = collect_specs(
+            "本机", channels, tools, args.branch, memo,
+            lambda c: local_channel_exists(c, args.local_root),
+            lambda c: find_product_json(c)[1],
+            lambda c: CHANNELS[c][0])
+        failures += n_fail
+
+    server_specs = {}
+    remote = None                 # 服务器平台探测结果(决定下载哪个 arch 的包)
+    if do_remote:
+        try:
+            remote = detect_remote(args.server, args.remote_arch)
+        except ScriptError as e:
+            err(f"[服务器] {e}")
+            failures += 1
+        else:
+            print(f"  服务器: {remote}", flush=True)
+            server_specs, n_fail = collect_specs(
+                "服务器", channels, tools, args.branch, memo,
+                lambda c: remote_channel_exists(args.server, remote, c),
+                lambda c: remote_read_product(args.server, remote, c),
+                lambda c: CHANNELS[c][1])
+            failures += n_fail
+
+    # ---- 2. 逐个 tool 执行(每个通道用自己解析出的版本) ----
     cache = TgzCache()
     try:
-        memo = {}                 # branch → {tool: 版本},避免同一分支重复请求
-
-        # ---- 1. 每个通道先解析「实际」期望版本(本机读安装 product.json,服务器 SSH 读) ----
-        local_specs = {}          # channel -> {tool: (版本, 来源)}
         if do_local:
-            for channel in channels:
-                label = CHANNEL_LABEL[channel]
-                if not local_channel_exists(channel, args.local_root):
-                    print(f"  本机[{label}]: 通道未安装(无 {CHANNELS[channel][0]} 目录),跳过", flush=True)
-                    continue
-                _, product = find_product_json(channel)
-                try:
-                    specs = resolve_versions(product, channel, tools, args.branch, memo)
-                except ScriptError as e:
-                    err(f"[本机 {label}] {e}")
-                    failures += 1
-                    continue
-                local_specs[channel] = specs
-                print(f"  本机[{label}] 期望: " + " · ".join(
-                    f"{t} {v}({s})" for t, (v, s) in specs.items()), flush=True)
-
-        server_specs = {}         # channel -> {tool: (版本, 来源)}
-        remote = None             # 服务器平台探测结果(决定下载哪个 arch 的包)
-        if do_remote:
-            try:
-                remote = detect_remote(args.server, args.remote_arch)
-            except ScriptError as e:
-                err(f"[服务器] {e}")
-                failures += 1
-        if do_remote and remote is not None:
-            print(f"  服务器: {remote}", flush=True)
-            for channel in channels:
-                label = CHANNEL_LABEL[channel]
-                if not remote_channel_exists(args.server, remote, channel):
-                    print(f"  服务器[{label}]: 通道未安装(服务器无 {CHANNELS[channel][1]} 目录),跳过", flush=True)
-                    continue
-                product = remote_read_product(args.server, remote, channel)
-                try:
-                    specs = resolve_versions(product, channel, tools, args.branch, memo)
-                except ScriptError as e:
-                    err(f"[服务器 {label}] {e}")
-                    failures += 1
-                    continue
-                server_specs[channel] = specs
-                print(f"  服务器[{label}] 期望: " + " · ".join(
-                    f"{t} {v}({s})" for t, (v, s) in specs.items()), flush=True)
-
-        # ---- 2. 逐个 tool 执行(每个通道用自己解析出的版本) ----
-        if do_local and local_specs:
-            arch = local_arch()
-            sources = [args.local_root or default_local_root(c) for c in CHANNELS]
-            for tool in tools:
-                for channel, specs in local_specs.items():
-                    ver, _ = specs[tool]
-                    root = args.local_root or default_local_root(channel)
-                    label = CHANNEL_LABEL[channel]
-                    try:
-                        status = plan_local(root, tool, ver, arch, sources) if args.dry_run \
-                            else install_local(root, tool, ver, arch, cache, sources)
-                    except ScriptError as e:
-                        err(f"[本机 {label} {tool}] {e}")
-                        failures += 1
-                        continue
-                    print(f"  本机[{label}]: {status}", flush=True)
-
-        if do_remote and server_specs:
-            for tool in tools:
-                specs_tool = {c: specs[tool][0] for c, specs in server_specs.items()}
-                try:
-                    statuses = plan_server(args.server, tool, specs_tool, remote) if args.dry_run \
-                        else push_server(args.server, tool, specs_tool, cache, remote)
-                except ScriptError as e:
-                    err(f"[服务器 {tool}] {e}")
-                    failures += 1
-                    continue
-                for channel in server_specs:
-                    print(f"  服务器[{CHANNEL_LABEL[channel]}]: {statuses[channel]}", flush=True)
-
-        return 1 if failures else 0
+            failures += update_local(local_specs, tools, args.local_root, args.dry_run, cache)
+        if remote is not None:
+            failures += update_server(args.server, remote, server_specs, tools, args.dry_run, cache)
     finally:
         cache.cleanup()
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

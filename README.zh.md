@@ -47,8 +47,10 @@
 ## 前提
 
 - 本机: Python 3(纯标准库,零依赖);Windows 10 1803+(自带 System32\tar.exe);网络可达 vscode-cdn.net
-- 推送服务器: SSH 免密(密钥已配置在 ~/.ssh),服务器自带 tar;
-  Windows 服务器另需 PowerShell 与 `System32\tar.exe`(Windows 10 1803+ / Server 2019+)
+- 推送服务器: SSH 免密(密钥已配置在 ~/.ssh),本机有 `ssh`/`scp`,服务器自带 tar;
+  Windows 服务器另需 PowerShell 与 `System32\tar.exe`(Windows 10 1803+ / Server 2019+)。
+  传包用 `scp` + 相对文件名,落到远端家目录(POSIX 是 `$HOME`,Windows 是 `%USERPROFILE%`),
+  不用猜 `/tmp` 或盘符。
 
 ## 用法
 
@@ -79,8 +81,12 @@ python update_agent_sdk.py --server-only --server <别名>  # 只推送服务器
 (`robocopy` / `cp -a`,免下载);服务器同理——服务器某通道已装好时,其余通道在服务器内直接复用
 (POSIX 下 `cp -a`,Windows 下 `Copy-Item`),不再下载;服务器内复制失败时自动回落到下载安装。
 只有任何一处都没有副本时,才「下载 → 流式校验包内 version 字段 → 解压 → 原子改名 → 写 `.complete`」;
-同一版本需要装多个目标时该包也只下载一次(本机各通道、服务器各通道均复用)。
-任一失败即清理临时产物,逐个 tool 独立,一个失败不影响另一个。
+同一版本需要装多个目标时该包也只下载一次(本机各通道、服务器各通道均复用)。逐个 tool 独立,一个失败不影响另一个。
+
+下载专门做了容错:这个 CDN 在网络抖动时经常传到一半就断,所以断点会**用 HTTP Range 续传**
+(只要每次还能多下一点就一直重试;连续两次一个字节都没多才放弃),4xx 不重试;下好的 `.tgz`
+缓存在系统临时目录(`<temp>/agent-sdk-tgz-cache`,30 天过期),下次运行接着上次的位置继续,而不是从头再来。
+上传(`scp`)同样会重试,并先删掉上次中断留下的同名文件。
 
 ## 定时示例
 
@@ -95,6 +101,21 @@ Linux 服务器(若直接在服务器上跑:服务器上会自动走 `~/.vscode-
 ```cron
 0 17 * * * cd ~/vscode-agent-sdk-update && python3 update_agent_sdk.py --tool all
 ```
+
+## 开发
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest            # tests/ 全程不联网: 假 SSH 传输 + 本地造的 tgz
+python -m pylint update_agent_sdk.py tests
+```
+
+测试不触网: 版本查询被替换成假实现,安装包用 `tarfile` 现场造。SSH 传输是「假传输」——
+把生成的命令在本机真跑一遍:POSIX 命令交给 `sh`(没有就跳过),Windows 那套交给
+`powershell -EncodedCommand`(USERPROFILE 指向沙箱),所以两套命令方言都是真执行,不是纯字符串断言。
+
+CI(GitHub Actions,`.github/workflows/ci.yml`):pylint 跑一次,pytest 在
+ubuntu-latest + windows-latest × Python 3.9/3.13 上跑,各系统覆盖自己能跑的那套命令方言。
 
 ## 许可
 

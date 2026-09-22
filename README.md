@@ -50,8 +50,10 @@ version each channel expects**, so local claude / codex just work.
 ## Requirements
 
 - Local: Python 3 (standard library only, zero dependencies); Windows 10 1803+ ships System32\tar.exe; network access to vscode-cdn.net
-- Server push: passwordless SSH (key configured in ~/.ssh), tar present on the server;
-  Windows servers also need PowerShell and `System32\tar.exe` (Windows 10 1803+ / Server 2019+)
+- Server push: passwordless SSH (key configured in ~/.ssh) plus `ssh`/`scp` clients locally; tar present on the server;
+  Windows servers also need PowerShell and `System32\tar.exe` (Windows 10 1803+ / Server 2019+).
+  The package is copied with `scp` to a relative filename, which lands in the remote home on
+  every platform (POSIX `$HOME`, Windows `%USERPROFILE%`) — no `/tmp` or drive-letter guessing.
 
 ## Usage
 
@@ -85,7 +87,13 @@ if one server channel has it, the others reuse it via an in-server copy (`cp -a`
 is downloaded; if that in-server copy fails, the script falls back to downloading.
 Only when no copy exists anywhere does the script do "download → stream-verify the in-package version field → extract → atomic
 rename → write `.complete`"; a package needed by multiple targets is downloaded only once (shared across local channels and
-server channels alike). Any failure cleans up temp artifacts; tools are independent, one failing does not block the other.
+server channels alike). Tools are independent: one failing does not block the other.
+
+Downloads are resilient on purpose: the CDN often stops mid-transfer on flaky links, so an interrupted download is
+**resumed with an HTTP Range request** (retried while it keeps making progress, given up only after two attempts with zero
+progress), 4xx is not retried, and the downloaded `.tgz` files are cached under the system temp directory
+(`<temp>/agent-sdk-tgz-cache`, pruned after 30 days) so a later run picks up where the previous one stopped instead of
+starting over. Uploads (`scp`) are retried too, and a stale same-named file from an interrupted run is removed first.
 
 ## Scheduling examples
 
@@ -100,6 +108,23 @@ Linux server (when running directly on the server, it automatically uses the `~/
 ```cron
 0 17 * * * cd ~/vscode-agent-sdk-update && python3 update_agent_sdk.py --tool all
 ```
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest            # tests/ — 不联网: 假 SSH 传输 + 本地造的 tgz
+python -m pylint update_agent_sdk.py tests
+```
+
+Tests never touch the network: version lookups are monkeypatched and packages are built locally
+with `tarfile`. The SSH transport is faked by running the generated commands on the test machine —
+POSIX commands through `sh` (skipped where there is none), the Windows path through
+`powershell -EncodedCommand` with a sandboxed `USERPROFILE` — so both command dialects are really
+executed, not just string-matched.
+
+CI (GitHub Actions, `.github/workflows/ci.yml`) runs pylint once and pytest on
+ubuntu-latest + windows-latest across Python 3.9/3.13; each OS exercises the command dialect it can run.
 
 ## License
 
