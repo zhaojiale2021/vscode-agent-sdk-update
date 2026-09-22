@@ -427,6 +427,11 @@ def detect_remote(server, arch_override=""):
     arch = arch_override or arch_of(os_name, machine)
     if not arch:
         raise ScriptError(f"无法识别的服务器架构: {os_name}/{machine}(可用 --remote-arch 指定)")
+    if arch_override:
+        # 手动指定架构时以架构为准推断系统: 说 win32-x64 就是要装 Windows 包,
+        # 命令方言也得跟着走 PowerShell, 不能还按探测到的 Linux 发 POSIX 命令
+        os_name = {"win32": "windows", "linux": "linux", "darwin": "darwin"}.get(
+            arch.split("-")[0], os_name)
     return Remote(os_name, arch)
 
 

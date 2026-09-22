@@ -117,6 +117,13 @@ def test_detect_remote_arch_override(uas, monkeypatch):
     assert uas.detect_remote("host", "linux-arm64").arch == "linux-arm64"
 
 
+def test_remote_arch_override_also_sets_os(uas, monkeypatch):
+    """指定 win32-x64 就要走 PowerShell 方言,不能还按探测到的 Linux 发 POSIX 命令。"""
+    patch(monkeypatch, uas, {"uname": "Linux\nx86_64"})
+    remote = uas.detect_remote("host", "win32-x64")
+    assert (remote.os, remote.arch, remote.is_windows) == ("windows", "win32-x64", True)
+
+
 def test_detect_unreachable_server_reports_ssh_error(uas, monkeypatch):
     err = uas.ScriptError("Permission denied (publickey)")
     patch(monkeypatch, uas, {"uname": err, "cmd /c": err})

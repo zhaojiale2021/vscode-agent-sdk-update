@@ -65,6 +65,27 @@ class LocalTransport:
         self.calls = []                      # 记录收到的命令, 供断言
         self.uploads = []                    # 记录上传过的文件名
         self.powershell = _find_powershell() if self.windows else ""
+        if self.windows and sys.platform != "win32":
+            self._shim_system_tar()
+
+    @property
+    def sysroot(self):
+        """Windows 方言脚本里的 %SystemRoot%。"""
+        return self.root / "Windows"
+
+    def _shim_system_tar(self):
+        """非 Windows 上用 pwsh 跑「Windows 那套命令」时, 造一个 System32\\tar.exe。
+
+        被测脚本用的是 $env:SystemRoot\\System32\\tar.exe(Windows 自带), 在 Linux 上
+        SystemRoot 为空会直接报「Path 为 null」; 放个转发给系统 tar 的脚本, Windows
+        命令方言就能在任何平台被真执行(而不是只在 Windows 上跳过)。
+        """
+        bindir = self.sysroot / "System32"
+        bindir.mkdir(parents=True, exist_ok=True)
+        tar_exe = bindir / "tar.exe"
+        if not tar_exe.exists():
+            tar_exe.write_text('#!/bin/sh\nexec tar "$@"\n', encoding="utf-8")
+            tar_exe.chmod(0o755)
 
     @property
     def available(self):
@@ -72,9 +93,12 @@ class LocalTransport:
         return bool(self.powershell) if self.windows else bool(shutil.which("sh"))
 
     def env(self):
-        """子进程环境: 把用户目录指到沙箱。"""
+        """子进程环境: 把用户目录指到沙箱(Windows 方言还要 SystemRoot)。"""
         if self.windows:
-            return dict(os.environ, USERPROFILE=str(self.root))
+            env = dict(os.environ, USERPROFILE=str(self.root))
+            if sys.platform != "win32":
+                env["SystemRoot"] = str(self.sysroot)
+            return env
         return dict(os.environ, HOME=str(self.root))
 
     def _run(self, argv, stdin):

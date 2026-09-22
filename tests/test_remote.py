@@ -6,7 +6,7 @@ import json
 import os
 
 import pytest
-from conftest import encoded_ps, make_tgz
+from conftest import LocalTransport, encoded_ps, make_tgz
 
 NPM_CLAUDE = "@anthropic-ai/claude-agent-sdk"
 
@@ -107,6 +107,17 @@ def test_remote_rm_ignores_missing(uas, monkeypatch):
 def seed_channel(sandbox, channel):
     (sandbox / (".vscode-server" if channel == "stable" else ".vscode-server-insiders") / "data").mkdir(
         parents=True, exist_ok=True)
+
+
+def test_windows_transport_has_system_tar(uas, sandbox):
+    """非 Windows 上用 pwsh 跑 Windows 方言时, System32\\tar.exe 由沙箱顶上。
+
+    脚本里写的是 $env:SystemRoot\\System32\\tar.exe;真 Windows 上有,
+    Linux CI(装了 pwsh)上没有, 没有就会报「Path 为 null」。
+    """
+    transport = LocalTransport(uas, sandbox, "windows")
+    transport._shim_system_tar()          # 显式调用, 各平台都能验
+    assert (transport.sysroot / "System32" / "tar.exe").is_file()
 
 
 def test_channel_and_marker_roundtrip(uas, transport, remote_of, sandbox):
