@@ -2,16 +2,34 @@
 
 # 更新 VS Code (stable / Insiders) agent-host 的 SDK 缓存 (claude / codex)
 
-> 目的:**不用订阅 Copilot,也能使用本地的 claude / codex**。
+> **上游现状——先看这里。** 从 VS Code **1.138.0**(Insiders 自 2026-09-05)起,Agents 窗口会自己
+> 弹通知要求下载 SDK,并带有明确的 **Download** 按钮,不再看 GitHub 登录状态或 Copilot 订阅
+> ([microsoft/vscode#334316](https://github.com/microsoft/vscode/pull/334316);文案后续
+> [#334672](https://github.com/microsoft/vscode/pull/334672) / [#334668](https://github.com/microsoft/vscode/issues/334668))。
+> 本机 1.138+ 一般直接点 **Download** 就行,不需要本脚本。
+>
+> 本仓库仍然有效的场景:
+>
+> - **远程 SSH 主机**——下载通知只为*本地* Agent Host 会话创建,远端永远收不到,Claude/Codex
+>   会一直卡在 "SDK not downloaded yet"([microsoft/vscode#339496](https://github.com/microsoft/vscode/issues/339496),
+>   到 1.140 仍未修)。本脚本通过 SSH 把匹配的包推到服务器。
+> - **预置 / 离线 / 慢网或抖动链路**——下一份包,本机各通道与服务器复用,断点续传,
+>   第一次对话前不用等下载。升级 VS Code 前预跑一遍尤其省事:新构建会 pin 新版本。
+> - **定时 / 精确版本**——按每个已装构建 `product.json` 里 `agentSdks` 的版本精确安装,并按计划
+>   (计划任务 / cron)刷新,同时保留旧版本,降级也不至于不可用。
 
-没有 Copilot 订阅时,agent-host 无法自己触发 SDK 下载——日志里会出现
+## 这个脚本为什么曾经需要
+
+1.138 之前,SDK 下载只作为「已登录/有订阅」的账号设置流程的一部分被提供。没有 Copilot 订阅时
+这个触发永远不会发生,日志停在
 
 ```
 [Claude] SDK not downloaded yet; deferring chat metadata until a session triggers the download
 ```
 
-但「session 触发下载」永远不会发生,于是 claude/codex 一直不可用。
-本脚本按**各通道实际期望的版本**把 SDK 包预置到 agent-host 的 sdk-cache 目录,本地即可直接使用 claude / codex。
+于是 claude/codex 一直不可用——即便用户手里有完全可用的 Anthropic key 走 BYOK
+([microsoft/vscode#334405](https://github.com/microsoft/vscode/issues/334405))。本脚本按
+**各通道实际期望的版本**把 SDK 包预置到 agent-host 的 sdk-cache 目录,这也正是上面远程场景仍然需要的做法。
 
 ## 工作原理
 
@@ -123,6 +141,10 @@ ubuntu-latest + windows-latest × Python 3.9/3.13 上跑,各系统覆盖自己�
 
 ## 常见问题
 
+- **VS Code 已经有 Download 按钮了,还需要这个脚本吗?** 本机 **1.138+** 一般不需要:在 Agents 窗口点
+  **Download** 即可(见开头「上游现状」)。脚本仍然负责**远程 SSH 主机**(下载通知只覆盖本地,上游
+  [#339496](https://github.com/microsoft/vscode/issues/339496) 未修)、离线/慢网,以及按计划、按构建精确
+  版本的刷新。
 - **`win-x64` 会 404**: CDN 上 arch 名为 `win32-x64`(缓存目录同样是 `win32-x64`),脚本自动识别,无需关心。
 - **我要推送到 Windows 服务器**: 架构会探测成 `win32-x64` / `win32-arm64`,不再是 `linux-x64`;缓存位于
   `%USERPROFILE%\.vscode-server[-insiders]\data\agent-host\sdk-cache`。默认 shell 是 Git Bash 的 Windows 服务器

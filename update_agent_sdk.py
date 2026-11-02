@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """自动更新 VS Code (stable / Insiders) agent-host 的 SDK 缓存 (claude / codex)。
 
-用途: 无需 Copilot 订阅即可使用本地 claude / codex——agent-host 日志出现
+用途: 预置/更新 VS Code agent-host 的 SDK 缓存。VS Code 1.138+ 在本机已能在 Agents
+窗口直接点 Download 下载(见 README「上游现状」);本脚本主要面向远程 SSH 主机
+(上游的下载通知只覆盖本地会话)、离线/慢网、以及按计划按构建精确版本预置。
+旧版(<=1.137)日志会停在
 "[Claude] SDK not downloaded yet; deferring chat metadata until a session
-triggers the download" 时永远不会触发下载, 本脚本提前把 SDK 缓存预置到位。
+triggers the download" 而永远不触发下载。
 
 用法示例:
     python update_agent_sdk.py                        # 更新本机 stable+Insiders 全部
@@ -1057,7 +1060,8 @@ def build_parser():
         description="更新 VS Code agent-host 的 SDK 缓存(claude/codex,stable+Insiders),"
                     "版本按通道取「实际」对应关系(已安装 VS Code product.json 的 agentSdks,"
                     "取不到时回退 vscode 仓库 release/<x> 或 main);"
-                    "免 Copilot 订阅也可本地使用 claude/codex",
+                    "适合远程 SSH 主机、离线/慢网与定时预置"
+                    "(VS Code 1.138+ 本机可直接在 Agents 窗口点 Download)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--server", metavar="SSH_ALIAS",

@@ -2,17 +2,39 @@
 
 # Update VS Code (stable / Insiders) agent-host SDK cache (claude / codex)
 
-> Goal: **use local claude / codex without a Copilot subscription**.
+> **Upstream status — read this first.** Since VS Code **1.138.0** (Insiders from 2026-09-05),
+> the Agents window asks for the SDK itself: whenever the SDK is missing it shows a notification
+> with an explicit **Download** action, regardless of GitHub sign-in or Copilot entitlement
+> ([microsoft/vscode#334316](https://github.com/microsoft/vscode/pull/334316), wording follow-up
+> [#334672](https://github.com/microsoft/vscode/pull/334672) / [#334668](https://github.com/microsoft/vscode/issues/334668)).
+> On a local 1.138+ install you can normally just click **Download** — no script needed.
+>
+> This repo is still useful where that path does not reach:
+>
+> - **Remote SSH hosts** — the download notification is created only for *local* Agent Host
+>   sessions, so a remote host never offers it and Claude/Codex stay on
+>   "SDK not downloaded yet" ([microsoft/vscode#339496](https://github.com/microsoft/vscode/issues/339496),
+>   still open on 1.140). This script pushes the matching package to the server over SSH.
+> - **Pre-seeding, offline, or slow/flaky links** — download once, reuse the same package across
+>   local channels and servers, resume interrupted transfers, and never wait for a download
+>   during the first chat. Handy before a VS Code update: the new build pins a new version.
+> - **Scheduled / version-exact installs** — resolve the exact version each installed build pins
+>   (`product.json` → `agentSdks`) and refresh it on a schedule (Task Scheduler / cron), keeping
+>   old versions around so a downgrade does not break.
 
-Without a Copilot subscription, agent-host cannot trigger the SDK download itself — the log shows
+## Why this script existed
+
+Before 1.138 the SDK download was offered only as part of signed-in/entitlement setup. Without a
+Copilot subscription the trigger never fired and the log showed
 
 ```
 [Claude] SDK not downloaded yet; deferring chat metadata until a session triggers the download
 ```
 
-but "session triggers the download" never happens, leaving claude / codex unavailable.
-This script pre-seeds the SDK packages into the agent-host sdk-cache directory with the **actual
-version each channel expects**, so local claude / codex just work.
+leaving claude / codex unavailable — even for BYOK users who had a perfectly good Anthropic key
+([microsoft/vscode#334405](https://github.com/microsoft/vscode/issues/334405)). This script
+pre-seeds the SDK packages into the agent-host sdk-cache directory with the **actual version each
+channel expects**, which is what the remote case above still needs.
 
 ## How it works
 
@@ -132,6 +154,11 @@ ubuntu-latest + windows-latest across Python 3.9/3.13; each OS exercises the com
 
 ## FAQ
 
+- **VS Code now has a Download button — do I still need this?** On a local **1.138+** install,
+  usually no: click **Download** in the Agents window (see the status note at the top). The script
+  is still the way to handle **remote SSH hosts** (the offer is local-only, upstream
+  [#339496](https://github.com/microsoft/vscode/issues/339496)), offline/slow links, and scheduled,
+  version-exact refreshes.
 - **`win-x64` gives 404**: the CDN arch name is `win32-x64` (the cache directory is `win32-x64` too); the script detects it automatically.
 - **I push to a Windows server**: the arch is detected as `win32-x64` / `win32-arm64` instead of `linux-x64`; the cache lives under
   `%USERPROFILE%\.vscode-server[-insiders]\data\agent-host\sdk-cache`. Windows servers with a Git Bash default shell use the normal POSIX commands;
