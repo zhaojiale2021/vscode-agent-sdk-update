@@ -31,8 +31,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        python-version: ["3.9", "3.13"]
+        # ubuntu-latest 已经迁到 Ubuntu 26.04,那里没有 Python 3.9 的构建;
+        # 3.9 固定跑 24.04,3.13 跟最新的 latest。
+        include:
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: ubuntu-24.04
+            python-version: "3.9"
+          - os: windows-latest
+            python-version: "3.9"
+          - os: windows-latest
+            python-version: "3.13"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

@@ -133,7 +133,8 @@ python -m pylint update_agent_sdk.py tests
 `powershell -EncodedCommand`(USERPROFILE 指向沙箱),所以两套命令方言都是真执行,不是纯字符串断言。
 
 CI(GitHub Actions,`.github/workflows/ci.yml`):pylint 跑一次,pytest 在
-ubuntu-latest + windows-latest × Python 3.9/3.13 上跑,各系统覆盖自己能跑的那套命令方言。
+ubuntu + windows × Python 3.9/3.13 上跑(3.9 用 ubuntu-24.04,`ubuntu-latest` 镜像已经不带它了),
+各系统覆盖自己能跑的那套命令方言。
 
 ## 许可
 
