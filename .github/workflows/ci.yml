@@ -31,8 +31,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        python-version: ["3.9", "3.13"]
+        # ubuntu-latest 已经迁到 Ubuntu 26.04,那里没有 Python 3.9 的构建;
+        # 3.9 固定跑 24.04,3.13 跟最新的 latest。
+        include:
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: ubuntu-24.04
+            python-version: "3.9"
+          - os: windows-latest
+            python-version: "3.9"
+          - os: windows-latest
+            python-version: "3.13"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -45,3 +54,19 @@ jobs:
       - run: python -m pytest -q
       - name: CLI 冒烟(未装 VS Code 时应静默跳过)
         run: python update_agent_sdk.py --dry-run --local-only
+
+  # 汇总门禁:分支 ruleset 只要求 "CI required" 这一个稳定的检查名,
+  # 以后增删矩阵维度或给作业改名,都不用回头改 ruleset。
+  gate:
+    name: CI required
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: always()
+    steps:
+      - name: 所有上游作业都成功才算通过
+        run: |
+          echo "lint=${{ needs.lint.result }} test=${{ needs.test.result }}"
+          if [ "${{ needs.lint.result }}" != "success" ] || [ "${{ needs.test.result }}" != "success" ]; then
+            echo "::error::上游作业失败或被取消,门禁不通过"
+            exit 1
+          fi

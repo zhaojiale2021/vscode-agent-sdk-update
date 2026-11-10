@@ -146,7 +146,8 @@ POSIX commands through `sh` (skipped where there is none), the Windows path thro
 executed, not just string-matched.
 
 CI (GitHub Actions, `.github/workflows/ci.yml`) runs pylint once and pytest on
-ubuntu-latest + windows-latest across Python 3.9/3.13; each OS exercises the command dialect it can run.
+ubuntu + windows across Python 3.9/3.13 (3.9 on ubuntu-24.04, since the
+`ubuntu-latest` image no longer ships it); each OS exercises the command dialect it can run.
 
 ## License
 
