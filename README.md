@@ -2,6 +2,9 @@
 
 # Update VS Code (stable / Insiders) agent-host SDK cache (claude / codex)
 
+[![CI](https://github.com/zhaojiale2021/vscode-agent-sdk-update/actions/workflows/ci.yml/badge.svg)](https://github.com/zhaojiale2021/vscode-agent-sdk-update/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 > **Upstream status — read this first.** Since VS Code **1.138.0** (Insiders from 2026-09-05),
 > the Agents window asks for the SDK itself: whenever the SDK is missing it shows a notification
 > with an explicit **Download** action, regardless of GitHub sign-in or Copilot entitlement

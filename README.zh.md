@@ -2,6 +2,9 @@
 
 # 更新 VS Code (stable / Insiders) agent-host 的 SDK 缓存 (claude / codex)
 
+[![CI](https://github.com/zhaojiale2021/vscode-agent-sdk-update/actions/workflows/ci.yml/badge.svg)](https://github.com/zhaojiale2021/vscode-agent-sdk-update/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 > **上游现状——先看这里。** 从 VS Code **1.138.0**(Insiders 自 2026-09-05)起,Agents 窗口会自己
 > 弹通知要求下载 SDK,并带有明确的 **Download** 按钮,不再看 GitHub 登录状态或 Copilot 订阅
 > ([microsoft/vscode#334316](https://github.com/microsoft/vscode/pull/334316);文案后续
