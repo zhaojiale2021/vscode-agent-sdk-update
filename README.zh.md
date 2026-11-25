@@ -5,6 +5,17 @@
 [![CI](https://github.com/zhaojiale2021/vscode-agent-sdk-update/actions/workflows/ci.yml/badge.svg)](https://github.com/zhaojiale2021/vscode-agent-sdk-update/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+**为 VS Code Stable / Insiders 预置 Claude / Codex SDK 缓存。**
+
+```bash
+python update_agent_sdk.py
+python update_agent_sdk.py --server <SSH别名>
+python update_agent_sdk.py --channel stable --tool codex
+```
+
+脚本读取已安装构建所 pin 的 SDK 版本，并把包下载或复制到 agent-host
+缓存，支持远程 SSH 主机。VS Code 1.138+ 本机通常可直接使用内置 **Download**。
+
 > **上游现状——先看这里。** 从 VS Code **1.138.0**(Insiders 自 2026-09-05)起,Agents 窗口会自己
 > 弹通知要求下载 SDK,并带有明确的 **Download** 按钮,不再看 GitHub 登录状态或 Copilot 订阅
 > ([microsoft/vscode#334316](https://github.com/microsoft/vscode/pull/334316);文案后续

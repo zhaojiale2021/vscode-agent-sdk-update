@@ -5,6 +5,18 @@
 [![CI](https://github.com/zhaojiale2021/vscode-agent-sdk-update/actions/workflows/ci.yml/badge.svg)](https://github.com/zhaojiale2021/vscode-agent-sdk-update/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+**Pre-seed Claude/Codex SDK caches for VS Code Stable and Insiders.**
+
+```bash
+python update_agent_sdk.py
+python update_agent_sdk.py --server <ssh-alias>
+python update_agent_sdk.py --channel stable --tool codex
+```
+
+The script reads each installed build's pinned SDK versions, downloads or copies
+packages into the agent-host cache, and supports remote SSH hosts. Local VS Code
+1.138+ can usually use the built-in **Download** action instead.
+
 > **Upstream status — read this first.** Since VS Code **1.138.0** (Insiders from 2026-09-05),
 > the Agents window asks for the SDK itself: whenever the SDK is missing it shows a notification
 > with an explicit **Download** action, regardless of GitHub sign-in or Copilot entitlement
